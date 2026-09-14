@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/Adv2Obj.Core/Adv2Obj.Core.csproj" />
+  <Project Path="src/Adv2Obj.App/Adv2Obj.App.csproj" />
+  <Project Path="tests/Adv2Obj.Validation/Adv2Obj.Validation.csproj" />
+</Solution>
