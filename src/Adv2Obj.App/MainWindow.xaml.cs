@@ -27,7 +27,7 @@ public partial class MainWindow : Window
 
     private void BrowseOutput_Click(object sender, RoutedEventArgs e)
     {
-        string? folder = ChooseFolder("Select the folder for OBJ files", OutputFolderTextBox.Text);
+        string? folder = ChooseFolder("Select the parent folder for converted stone folders", OutputFolderTextBox.Text);
         if (folder is null) return;
         OutputFolderTextBox.Text = folder;
         RefreshFileList();
@@ -57,9 +57,9 @@ public partial class MainWindow : Window
             {
                 FileName = Path.GetFileName(path),
                 InputPath = path,
-                OutputPath = string.IsNullOrWhiteSpace(outputFolder)
+                OutputDirectory = string.IsNullOrWhiteSpace(outputFolder)
                     ? string.Empty
-                    : Path.Combine(outputFolder, Path.GetFileNameWithoutExtension(path) + ".obj")
+                    : Path.Combine(outputFolder, Path.GetFileNameWithoutExtension(path))
             });
         }
         SummaryText.Text = Files.Count == 0
@@ -98,13 +98,18 @@ public partial class MainWindow : Window
             item.Details = string.Empty;
             try
             {
-                ConversionResult result = await _converter.ConvertAsync(item.InputPath, item.OutputPath);
+                ConversionResult result = await _converter.ConvertAsync(item.InputPath, OutputFolderTextBox.Text);
                 succeeded++;
-                item.Status = result.RepairedVertexCount == 0 ? "Completed" : "Completed*";
-                item.Details = result.RepairedVertexCount == 0
-                    ? $"{result.VertexCount:N0} vertices, {result.FaceCount:N0} faces"
-                    : $"{result.VertexCount:N0} vertices, {result.FaceCount:N0} faces; "
-                      + $"{result.RepairedVertexCount:N0} repaired";
+                item.Status = result.Warnings.Count == 0 ? "Completed" : "Completed*";
+                item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
+                if (result.RepairedVertexCount > 0)
+                {
+                    item.Details += $"; {result.RepairedVertexCount:N0} repaired";
+                }
+                if (result.Warnings.Count > 0)
+                {
+                    item.Details += "; " + string.Join(" ", result.Warnings);
+                }
             }
             catch (Exception exception) when (exception is AdvFormatException or IOException or UnauthorizedAccessException)
             {

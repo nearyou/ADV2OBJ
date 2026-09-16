@@ -10,7 +10,7 @@ public sealed class FileConversionItem : INotifyPropertyChanged
 
     public required string FileName { get; init; }
     public required string InputPath { get; init; }
-    public required string OutputPath { get; init; }
+    public required string OutputDirectory { get; init; }
 
     public string Status
     {

@@ -4,4 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="geometry3Sharp" Version="1.0.324" />
+  </ItemGroup>
 </Project>

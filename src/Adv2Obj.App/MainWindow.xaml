@@ -29,7 +29,7 @@
 
         <StackPanel Grid.Row="0" Margin="0,0,0,22">
             <TextBlock Text="ADV to OBJ Converter" FontSize="28" FontWeight="Bold" Foreground="#17233C" />
-            <TextBlock Text="Batch-convert Sarine Advisor rough meshes to Wavefront OBJ files."
+            <TextBlock Text="Batch-convert Sarine Advisor files into complete OBJ/CSV/INI folders."
                        Margin="0,6,0,0" FontSize="14" Foreground="#5D6B82" />
         </StackPanel>
 
