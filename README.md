@@ -24,6 +24,9 @@ Each input file produces this structure:
 
 Each conversion is written to a staging directory and published only after
 all files are complete. Existing output is preserved if conversion fails.
+After a successful publish, the app deletes that source `.adv` file. Failed or
+cancelled inputs remain in place. If the source changed during conversion or
+cannot be deleted, the completed output remains and the row says **Input retained**.
 
 ## Build and run
 
@@ -32,9 +35,15 @@ dotnet build src/Adv2Obj.App/Adv2Obj.App.csproj -c Release
 dotnet run --project src/Adv2Obj.App/Adv2Obj.App.csproj
 ```
 
-The app targets .NET 8 on Windows and does not require Advisor or MeshLab at runtime.
-After publishing, launch `ADV2OBJ.exe` in the selected publish directory. The target computer
-must have the .NET 8 Desktop Runtime installed.
+To create the copyable single-file Windows release:
+
+```powershell
+dotnet publish src/Adv2Obj.App/Adv2Obj.App.csproj -c Release -p:PublishProfile=SingleFile
+```
+
+The release is `artifacts/ADV2OBJ-single/ADV2OBJ.exe`. Copy that file alone to a
+64-bit Windows computer; it includes the .NET 8 Desktop Runtime and the app's
+resources. Advisor and MeshLab are not required to run the converter.
 
 ## Sample validation
 

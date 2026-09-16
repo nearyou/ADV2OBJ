@@ -1,5 +1,69 @@
 using Adv2Obj.Core;
 
+if (args is ["--cleanup-check", string cleanupRoot])
+{
+    string cleanupTemporary = Directory.CreateTempSubdirectory("adv2obj-cleanup-").FullName;
+    try
+    {
+        string inputDirectory = Path.Combine(cleanupTemporary, "input");
+        string outputDirectory = Path.Combine(cleanupTemporary, "output");
+        Directory.CreateDirectory(inputDirectory);
+        string convertedInput = Path.Combine(inputDirectory, "M110-32219.adv");
+        File.Copy(Path.Combine(cleanupRoot, "Input", "M110-32219.adv"), convertedInput);
+
+        AdvToObjConverter cleanupConverter = new();
+        ConversionAndCleanupResult completed = await cleanupConverter.ConvertAndRemoveInputAsync(
+            convertedInput, outputDirectory);
+        string convertedDirectory = Path.Combine(outputDirectory, "M110-32219");
+        if (!completed.InputRemoved || File.Exists(convertedInput)
+            || Directory.GetFiles(convertedDirectory, "*.obj").Length != completed.Conversion.ObjectFileCount
+            || Directory.GetFiles(convertedDirectory, "*.csv").Length != 1
+            || Directory.GetFiles(convertedDirectory, "*.ini").Length != 1)
+        {
+            throw new Exception("A completed conversion did not retain its output and remove its input.");
+        }
+
+        string failedInput = Path.Combine(inputDirectory, "failed.adv");
+        await File.WriteAllBytesAsync(failedInput, [1, 2, 3]);
+        bool conversionFailed = false;
+        try
+        {
+            await cleanupConverter.ConvertAndRemoveInputAsync(failedInput, outputDirectory);
+        }
+        catch (AdvFormatException)
+        {
+            conversionFailed = true;
+        }
+        if (!conversionFailed || !File.Exists(failedInput))
+        {
+            throw new Exception("A failed conversion removed its input.");
+        }
+
+        string cancelledInput = Path.Combine(inputDirectory, "cancelled.adv");
+        File.Copy(Path.Combine(cleanupRoot, "Input", "M110-32219.adv"), cancelledInput);
+        bool conversionCancelled = false;
+        try
+        {
+            await cleanupConverter.ConvertAndRemoveInputAsync(
+                cancelledInput, outputDirectory, new CancellationToken(true));
+        }
+        catch (OperationCanceledException)
+        {
+            conversionCancelled = true;
+        }
+        if (!conversionCancelled || !File.Exists(cancelledInput))
+        {
+            throw new Exception("A cancelled conversion removed its input.");
+        }
+        Console.WriteLine("PASS input cleanup: completed input removed; failed and cancelled inputs retained.");
+    }
+    finally
+    {
+        Directory.Delete(cleanupTemporary, true);
+    }
+    return;
+}
+
 if (args is ["--probe-file", string singleInput, string singleOutput])
 {
     ConversionResult result = await new AdvToObjConverter().ConvertAsync(singleInput, singleOutput);

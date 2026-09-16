@@ -108,20 +108,29 @@ public partial class MainWindow : Window
                 try
                 {
                     string inputPath = item.InputPath;
-                    ConversionResult result = await Task.Run(
-                        () => _converter.ConvertAsync(inputPath, outputFolder, cancellationToken),
+                    ConversionAndCleanupResult outcome = await Task.Run(
+                        () => _converter.ConvertAndRemoveInputAsync(inputPath, outputFolder, cancellationToken),
                         cancellationToken);
                     succeeded++;
-                    item.Status = result.Warnings.Count == 0 ? "Completed" : "Completed";
+                    item.Status = outcome.InputRemoved ? "Completed" : "Input retained";
+                    ConversionResult result = outcome.Conversion;
                     item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
-                    // if (result.RepairedVertexCount > 0)
-                    // {
-                    //     item.Details += $"; {result.RepairedVertexCount:N0} repaired";
-                    // }
-                    // if (result.Warnings.Count > 0)
-                    // {
-                    //     item.Details += "; " + string.Join(" ", result.Warnings);
-                    // }
+                    if (result.RepairedVertexCount > 0)
+                    {
+                        item.Details += $"; {result.RepairedVertexCount:N0} repaired";
+                    }
+                    if (result.Warnings.Count > 0)
+                    {
+                        item.Details += "; " + string.Join(" ", result.Warnings);
+                    }
+                    if (outcome.InputRemoved)
+                    {
+                        item.Details += "; input ADV removed";
+                    }
+                    else
+                    {
+                        item.Details += $"; output completed, but input ADV was kept: {outcome.RetentionReason}";
+                    }
                 }
                 catch (OperationCanceledException)
                 {

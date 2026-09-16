@@ -8,3 +8,8 @@ public sealed record ConversionResult(
     int FaceCount,
     int RepairedVertexCount,
     IReadOnlyList<string> Warnings);
+
+public sealed record ConversionAndCleanupResult(
+    ConversionResult Conversion,
+    bool InputRemoved,
+    string? RetentionReason);

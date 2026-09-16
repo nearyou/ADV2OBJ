@@ -40,6 +40,35 @@ public sealed class AdvToObjConverter
     private static readonly HashSet<uint> FaceMarkers =
         AdvisorMasks.Select(mask => mask ^ 3u).ToHashSet();
 
+    public async Task<ConversionAndCleanupResult> ConvertAndRemoveInputAsync(
+        string inputPath,
+        string outputRoot,
+        CancellationToken cancellationToken = default)
+    {
+        FileInfo original = new(inputPath);
+        long originalLength = original.Length;
+        DateTime originalLastWrite = original.LastWriteTimeUtc;
+        ConversionResult conversion = await ConvertAsync(inputPath, outputRoot, cancellationToken);
+
+        try
+        {
+            FileInfo current = new(inputPath);
+            if (current.Exists && (current.Length != originalLength
+                || current.LastWriteTimeUtc != originalLastWrite))
+            {
+                return new ConversionAndCleanupResult(
+                    conversion, false, "The input ADV changed during conversion.");
+            }
+            File.Delete(inputPath);
+            return new ConversionAndCleanupResult(conversion, true, null);
+        }
+        catch (Exception error) when (error is IOException
+            or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return new ConversionAndCleanupResult(conversion, false, error.Message);
+        }
+    }
+
     public async Task<ConversionResult> ConvertAsync(
         string inputPath,
         string outputRoot,
@@ -860,7 +889,14 @@ public sealed class AdvToObjConverter
         List<GalaxyCandidate>? required = SelectGalaxySequence(candidates, 6);
         if (required is null)
         {
-            throw new AdvFormatException("The Galaxy symbol coordinate table was not found.");
+            // A valid Galaxy table can contain fewer than six entries. Its
+            // 32-bit count precedes contiguous 80-byte variant-2 records.
+            // Validate the complete table instead of inventing missing labels.
+            required = FindCountedGalaxyTable(source, candidates);
+            if (required is null)
+            {
+                throw new AdvFormatException("The Galaxy symbol coordinate table was not found.");
+            }
         }
 
         HashSet<int> usedCodes = required.Select(candidate => candidate.Code).ToHashSet();
@@ -879,6 +915,39 @@ public sealed class AdvToObjConverter
             .OrderBy(candidate => candidate.Ordinal)
             .Select(candidate => new GalaxySymbol(labels[candidate.Ordinal], candidate.Position))
             .ToList();
+    }
+
+    private static List<GalaxyCandidate>? FindCountedGalaxyTable(
+        byte[] source, List<GalaxyCandidate> candidates)
+    {
+        Dictionary<int, GalaxyCandidate> byOffset = candidates.ToDictionary(
+            candidate => candidate.Offset, candidate => candidate);
+        List<GalaxyCandidate>? best = null;
+        foreach (GalaxyCandidate first in candidates)
+        {
+            if (first.Offset < 4) continue;
+            uint count = ReadUInt32(source, first.Offset - 4);
+            if (count is < 3 or > 7) continue;
+            List<GalaxyCandidate> table = [];
+            for (int index = 0; index < count; index++)
+            {
+                if (!byOffset.TryGetValue(first.Offset + index * 80, out GalaxyCandidate? entry)
+                    || ReadUInt32(source, entry.Offset + 8) != 2)
+                {
+                    table.Clear();
+                    break;
+                }
+                table.Add(entry);
+            }
+            if (table.Count != count
+                || table.Select(item => item.Ordinal).Distinct().Count() != count
+                || table.Select(item => item.Code).Distinct().Count() != count)
+            {
+                continue;
+            }
+            if (best is null || table.Count > best.Count) best = table;
+        }
+        return best;
     }
 
     private static List<GalaxyCandidate>? SelectGalaxySequence(
