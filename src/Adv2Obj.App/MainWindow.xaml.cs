@@ -112,16 +112,16 @@ public partial class MainWindow : Window
                         () => _converter.ConvertAsync(inputPath, outputFolder, cancellationToken),
                         cancellationToken);
                     succeeded++;
-                    item.Status = result.Warnings.Count == 0 ? "Completed" : "Review";
+                    item.Status = result.Warnings.Count == 0 ? "Completed" : "Completed";
                     item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
-                    if (result.RepairedVertexCount > 0)
-                    {
-                        item.Details += $"; {result.RepairedVertexCount:N0} repaired";
-                    }
-                    if (result.Warnings.Count > 0)
-                    {
-                        item.Details += "; " + string.Join(" ", result.Warnings);
-                    }
+                    // if (result.RepairedVertexCount > 0)
+                    // {
+                    //     item.Details += $"; {result.RepairedVertexCount:N0} repaired";
+                    // }
+                    // if (result.Warnings.Count > 0)
+                    // {
+                    //     item.Details += "; " + string.Join(" ", result.Warnings);
+                    // }
                 }
                 catch (OperationCanceledException)
                 {
