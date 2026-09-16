@@ -1,5 +1,35 @@
 using Adv2Obj.Core;
 
+if (args is ["--probe-file", string singleInput, string singleOutput])
+{
+    ConversionResult result = await new AdvToObjConverter().ConvertAsync(singleInput, singleOutput);
+    Console.WriteLine($"OK {Path.GetFileName(singleInput)}: {result.ObjectFileCount} OBJ; "
+        + string.Join(" ", result.Warnings));
+    return;
+}
+
+if (args is ["--probe", string probeInput, string probeOutput])
+{
+    var probeConverter = new AdvToObjConverter();
+    int failures = 0;
+    foreach (string advFile in Directory.EnumerateFiles(probeInput, "*.adv").Order())
+    {
+        try
+        {
+            ConversionResult result = await probeConverter.ConvertAsync(advFile, probeOutput);
+            Console.WriteLine($"OK {Path.GetFileName(advFile)}: {result.ObjectFileCount} OBJ; "
+                + string.Join(" ", result.Warnings));
+        }
+        catch (Exception error)
+        {
+            failures++;
+            Console.WriteLine($"FAIL {Path.GetFileName(advFile)}: {error.GetType().Name}: {error.Message}");
+        }
+    }
+    Environment.ExitCode = failures == 0 ? 0 : 1;
+    return;
+}
+
 string root = args.Length > 0 ? Path.GetFullPath(args[0]) : Path.GetFullPath("../../../../");
 string input = Path.Combine(root, "Input");
 string referenceRoot = Path.Combine(root, "Output");

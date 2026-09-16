@@ -89,7 +89,6 @@ public partial class MainWindow : Window
         if (Files.Count == 0) return;
 
         ConvertButton.IsEnabled = false;
-        ClearButton.IsEnabled = false;
         CancelButton.IsEnabled = true;
         InputControls.IsEnabled = false;
         OutputControls.IsEnabled = false;
@@ -146,7 +145,6 @@ public partial class MainWindow : Window
             _conversionCancellation?.Dispose();
             _conversionCancellation = null;
             ConvertButton.IsEnabled = true;
-            ClearButton.IsEnabled = true;
             CancelButton.IsEnabled = false;
             InputControls.IsEnabled = true;
             OutputControls.IsEnabled = true;
@@ -160,11 +158,4 @@ public partial class MainWindow : Window
         _conversionCancellation?.Cancel();
     }
 
-    private void Clear_Click(object sender, RoutedEventArgs e)
-    {
-        Files.Clear();
-        ConversionProgress.Maximum = 1;
-        ConversionProgress.Value = 0;
-        SummaryText.Text = "History cleared. Click Convert to scan the selected input folder again.";
-    }
 }

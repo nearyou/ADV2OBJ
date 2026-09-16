@@ -10,7 +10,6 @@ files.
 2. Select the output directory.
 3. Click **Convert**.
 4. Review per-file completion, repair, or failure details in the status table.
-5. Click **Clear** to reset the status table and progress while keeping the selected folders.
 
 Each input file produces this structure:
 
@@ -23,19 +22,18 @@ Each input file produces this structure:
   <input-name>_SawsMD.ini
 ```
 
-Each file is written directly to its final filename with an exclusive stream
-that is closed before the next file starts. This avoids temporary-file rename
-failures and file-lock collisions on watched or synchronized output drives.
+Each conversion is written to a staging directory and published only after
+all files are complete. Existing output is preserved if conversion fails.
 
 ## Build and run
 
 ```powershell
-dotnet build Adv2Obj.slnx -c Release
+dotnet build src/Adv2Obj.App/Adv2Obj.App.csproj -c Release
 dotnet run --project src/Adv2Obj.App/Adv2Obj.App.csproj
 ```
 
 The app targets .NET 8 on Windows and does not require Advisor or MeshLab at runtime.
-After publishing, launch `artifacts/ADV2OBJ/ADV2OBJ.exe`. The target computer
+After publishing, launch `ADV2OBJ.exe` in the selected publish directory. The target computer
 must have the .NET 8 Desktop Runtime installed.
 
 ## Sample validation
@@ -73,6 +71,26 @@ For other ADV files, the converter decodes the rough mesh, indexed Galaxy symbol
 and Saw meshes are cut from the decoded rough surface. Advisor applies later cuts
 to a proprietary hierarchy of previously separated fragments; that hierarchy has
 not been decoded, so non-certified files with later cuts are marked **Review**.
+
+Advisor 8.1 files have additional damage and layout variants. The decoder can
+recover a DEFLATE member when the local ZIP method bytes are missing and can
+decode a raw, uncompressed rough-mesh record when no ZIP member is present. If
+the primary triangle table is damaged, it first searches for a complete closed
+mesh elsewhere in the ADV, then tries topology repair using the intact face
+records. These results are marked **Review** because they may not reproduce
+Advisor's exact rough surface. All twelve supplied Advisor 8.1 files now produce
+OBJ, CSV, and INI output; the 126 generated OBJ meshes pass closed-edge and
+index checks. The Pie/Saw fragment hierarchy is still reconstructed, so this
+does not establish exact Advisor export equivalence or universal ADV support.
+
+The six additional files described as Advisor 7.6 in `D:\ADV2OBJ\For-obj\76-new` also
+produce complete folders. Two files lose bytes within a vertex record; the
+decoder preserves the surviving vertices on both sides and reconstructs the
+affected coordinates. When a Pie companion boundary would erase an entire
+slice, the converter exports the cut-plane slab and marks it for review. These
+meshes are approximations: two cuts in `157-31-1` have one or two non-manifold
+edges near repaired coordinates and are identified in the conversion details
+for MeshLab review.
 
 Because ADV is proprietary and the samples show multiple damaged/variant record
 layouts, broader production compatibility requires more samples from every

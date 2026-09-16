@@ -54,7 +54,7 @@ public sealed class AdvToObjConverter
             source, inputPath, outputRoot, stem, cancellationToken);
         if (certified is not null) return certified;
 
-        (byte[] payload, int roughRecordEnd) = DecompressRoughPayload(source);
+        (byte[] payload, int roughRecordEnd, bool alternateRawMesh) = DecompressRoughPayload(source);
         Mesh mesh;
         try
         {
@@ -62,7 +62,35 @@ public sealed class AdvToObjConverter
         }
         catch (AdvFormatException)
         {
-            mesh = RepairDamagedMesh(payload);
+            Mesh? completeAlternate = CountFaceRecords(payload) < 100
+                ? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                : null;
+            if (completeAlternate is not null)
+            {
+                mesh = completeAlternate;
+                mesh.Warnings.Add(
+                    "Primary rough mesh is damaged; recovered a closed alternate mesh from the ADV. Verify its shape in MeshLab.");
+            }
+            else
+            {
+                try
+                {
+                    mesh = RepairDamagedMesh(payload);
+                }
+                catch (AdvFormatException primaryError)
+                {
+                    mesh = FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                        ?? throw new AdvFormatException(
+                            $"{primaryError.Message} No complete alternate mesh was found.");
+                    mesh.Warnings.Add(
+                        "Primary rough mesh is damaged; recovered a closed alternate mesh from the ADV. Verify its shape in MeshLab.");
+                }
+            }
+        }
+        if (alternateRawMesh)
+        {
+            mesh.Warnings.Add(
+                "Primary uncompressed rough mesh is damaged; recovered a later closed mesh from the ADV. Verify its shape in MeshLab.");
         }
         List<CutPlane> cuts = DecodeActiveCutPlanes(source, roughRecordEnd);
         Mesh cuttingMesh = mesh;
@@ -258,7 +286,7 @@ public sealed class AdvToObjConverter
         }
     }
 
-    private static (byte[] Payload, int RecordEnd) DecompressRoughPayload(byte[] source)
+    private static (byte[] Payload, int RecordEnd, bool AlternateRawMesh) DecompressRoughPayload(byte[] source)
     {
         int metadataOffset = checked((int)ReadUInt32(source, 0x34));
         int searchEnd = Math.Min(source.Length, metadataOffset + 1024);
@@ -289,13 +317,19 @@ public sealed class AdvToObjConverter
             int nameOffset = FindBytes(source, ZippedDataName, metadataOffset, searchEnd);
             if (nameOffset < 0)
             {
-                throw new AdvFormatException("The embedded rough-mesh payload was not found.");
+                return FindRawMeshPayload(source, metadataOffset)
+                    ?? throw new AdvFormatException(
+                        "No complete embedded ZIP or uncompressed rough mesh was found.");
             }
 
             int methodOffset = nameOffset - 22;
             EnsureRange(source, methodOffset, 22);
             ushort method = ReadUInt16(source, methodOffset);
-            if (method != 8)
+            // Advisor 8.1 can lose the first part of this local header. In
+            // observed files the method bytes become zero while the member is
+            // still DEFLATE (compressed size is smaller than declared size).
+            // Verify by inflating the bytes below rather than trusting them.
+            if (method != 8 && method != 0)
             {
                 throw new AdvFormatException("The embedded rough-mesh header is damaged.");
             }
@@ -312,7 +346,7 @@ public sealed class AdvToObjConverter
         byte[]? payload = TryInflate(compressedData);
         if (payload is not null)
         {
-            return (payload, checked(dataStart + compressedSize));
+            return (payload, checked(dataStart + compressedSize), false);
         }
 
         int failureOffset = FindInflateFailureOffset(compressedData);
@@ -338,7 +372,7 @@ public sealed class AdvToObjConverter
                     try
                     {
                         _ = DecodeMesh(payload);
-                        return (payload, checked(dataStart + compressedSize));
+                        return (payload, checked(dataStart + compressedSize), false);
                     }
                     catch (AdvFormatException)
                     {
@@ -351,10 +385,96 @@ public sealed class AdvToObjConverter
 
         if (bestCandidate is not null)
         {
-            return (bestCandidate, checked(dataStart + compressedSize));
+            return (bestCandidate, checked(dataStart + compressedSize), false);
         }
 
         throw new AdvFormatException("The embedded rough-mesh stream could not be decompressed.");
+    }
+
+    private static (byte[] Payload, int RecordEnd, bool AlternateRawMesh)? FindRawMeshPayload(
+        byte[] source, int metadataOffset)
+    {
+        // Some Advisor 8.1 files store the same indexed mesh record directly,
+        // without a ZIP member. Locate its closed triangle table by its count,
+        // then let DecodeMesh validate every index and the complete topology.
+        for (int offset = metadataOffset + 4; offset <= source.Length - 16; offset++)
+        {
+            if (BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(offset, 4)) != 3)
+            {
+                continue;
+            }
+
+            int end = offset;
+            while (end <= source.Length - 16
+                   && BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(end, 4)) == 3)
+            {
+                end += 16;
+            }
+            int faceCount = (end - offset) / 16;
+            if (faceCount >= 100
+                && (faceCount & 1) == 0
+                && BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(offset - 4, 4)) == faceCount)
+            {
+                byte[] candidate = source.AsSpan(metadataOffset, end - metadataOffset).ToArray();
+                try
+                {
+                    _ = DecodeMesh(candidate);
+                    bool alternate = offset - metadataOffset > 2_000_000;
+                    // A later mesh can be intact after the primary record was
+                    // damaged. The active cut plan still follows the primary
+                    // record, so scan from the metadata area in that case.
+                    return (candidate, alternate ? metadataOffset : end, alternate);
+                }
+                catch (AdvFormatException)
+                {
+                    // A face-count lookalike is not enough to prove a mesh.
+                }
+            }
+            offset = end - 1;
+        }
+        return null;
+    }
+
+    private static Mesh? FindAlternateClosedMesh(
+        byte[] source, int searchStart, CancellationToken cancellationToken)
+    {
+        Mesh? largest = null;
+        int offset = searchStart;
+        while ((offset = FindBytes(source, ZipSignature, offset, source.Length)) >= 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (offset > source.Length - 30) break;
+            int nameLength = ReadUInt16(source, offset + 26);
+            int extraLength = ReadUInt16(source, offset + 28);
+            long start = (long)offset + 30 + nameLength + extraLength;
+            uint compressedSize = ReadUInt32(source, offset + 18);
+            if (ReadUInt16(source, offset + 8) == 8
+                && nameLength == ZippedDataName.Length
+                && offset + 30 + nameLength <= source.Length
+                && source.AsSpan(offset + 30, nameLength).SequenceEqual(ZippedDataName)
+                && compressedSize is > 1000 and < 16_000_000
+                && start + compressedSize <= source.Length)
+            {
+                byte[]? payload = TryInflate(source.AsSpan((int)start, (int)compressedSize).ToArray());
+                if (payload is not null)
+                {
+                    try
+                    {
+                        Mesh candidate = DecodeMesh(payload);
+                        if (largest is null || candidate.Vertices.Count > largest.Vertices.Count)
+                        {
+                            largest = candidate;
+                        }
+                    }
+                    catch (AdvFormatException)
+                    {
+                        // Other embedded records are not complete rough meshes.
+                    }
+                }
+            }
+            offset++;
+        }
+        return largest;
     }
 
     private static byte[]? TryInflate(byte[] compressedData)
@@ -482,8 +602,16 @@ public sealed class AdvToObjConverter
                 CutPlane? companion = cuts.FirstOrDefault(candidate => candidate.Name == companionName);
                 if (companion is not null)
                 {
-                    slab = ClipClosedMesh(slab, companion.Normal,
+                    Mesh paired = ClipClosedMesh(slab, companion.Normal,
                         companion.Distance - companion.Width, keepLessOrEqual: false);
+                    if (paired.Vertices.Count >= 4 && paired.Faces.Count >= 4)
+                    {
+                        slab = paired;
+                    }
+                    else
+                    {
+                        source.Warnings.Add($"{cut.Name}: its companion boundary removed the entire slice; exported the cut-plane slab for visual review.");
+                    }
                 }
             }
         }
@@ -494,6 +622,11 @@ public sealed class AdvToObjConverter
             throw new AdvFormatException(
                 $"Cut object {cut.Name} does not intersect the rough mesh "
                 + $"(mesh range {minimum:G8}..{maximum:G8}, cut {cut.Distance - cut.Width:G8}..{cut.Distance:G8}).");
+        }
+        int invalidEdges = CountInvalidEdges(slab.Faces);
+        if (invalidEdges > 0)
+        {
+            source.Warnings.Add($"{cut.Name}: {invalidEdges} non-manifold cut edges remain near repaired coordinates; review this mesh in MeshLab.");
         }
         return slab;
     }
@@ -601,6 +734,18 @@ public sealed class AdvToObjConverter
 
         builder.CapOpenBoundaries();
         return new Mesh(builder.Vertices, builder.Faces, source.RepairedVertexCount, source.Warnings);
+    }
+
+    private static int CountInvalidEdges(List<(int A, int B, int C)> faces)
+    {
+        Dictionary<ulong, int> edges = new(faces.Count * 3 / 2);
+        foreach ((int a, int b, int c) in faces)
+        {
+            AddEdge(edges, a, b);
+            AddEdge(edges, b, c);
+            AddEdge(edges, c, a);
+        }
+        return edges.Values.Count(count => count != 2);
     }
 
     private static List<Vertex> ClipPolygon(
@@ -830,12 +975,18 @@ public sealed class AdvToObjConverter
     private static Mesh RepairDamagedMesh(byte[] payload)
     {
         int encodedFaceCount = CountFaceRecords(payload);
+        int faceStart;
+        int inferredVertexCount = 0;
         if (encodedFaceCount < 100)
         {
-            throw new AdvFormatException("A recoverable rough-mesh triangle table was not found.");
+            (faceStart, encodedFaceCount, inferredVertexCount) = FindPartialFaceTable(payload)
+                ?? throw new AdvFormatException("A recoverable rough-mesh triangle table was not found.");
+        }
+        else
+        {
+            faceStart = checked(payload.Length - 4 - encodedFaceCount * 16);
         }
 
-        int faceStart = checked(payload.Length - 4 - encodedFaceCount * 16);
         List<(uint Marker, uint A, uint B, uint C)> records = new(encodedFaceCount);
         List<uint> plausibleIndices = [];
         for (int index = 0; index < encodedFaceCount; index++)
@@ -848,9 +999,12 @@ public sealed class AdvToObjConverter
             uint c = ReadUInt32(payload, offset + 12) ^ mask;
             records.Add((marker, a, b, c));
             uint generousLimit = (uint)(encodedFaceCount / 2 + 1024);
-            if (a < generousLimit) plausibleIndices.Add(a);
-            if (b < generousLimit) plausibleIndices.Add(b);
-            if (c < generousLimit) plausibleIndices.Add(c);
+            if (inferredVertexCount == 0 || FaceMarkers.Contains(marker))
+            {
+                if (a < generousLimit) plausibleIndices.Add(a);
+                if (b < generousLimit) plausibleIndices.Add(b);
+                if (c < generousLimit) plausibleIndices.Add(c);
+            }
         }
 
         if (plausibleIndices.Count < encodedFaceCount * 2)
@@ -858,7 +1012,9 @@ public sealed class AdvToObjConverter
             throw new AdvFormatException("Too few rough-mesh indices survived for safe repair.");
         }
 
-        int vertexCount = checked((int)plausibleIndices.Max() + 1);
+        int vertexCount = inferredVertexCount > 0
+            ? inferredVertexCount
+            : checked((int)plausibleIndices.Max() + 1);
         int vertexStart = checked(faceStart - vertexCount * 24);
         if (vertexStart < 0)
         {
@@ -972,6 +1128,45 @@ public sealed class AdvToObjConverter
             warnings);
     }
 
+    private static (int FaceStart, int ReadableFaceCount, int VertexCount)? FindPartialFaceTable(
+        byte[] payload)
+    {
+        for (int offset = 4; offset <= payload.Length - 16; offset++)
+        {
+            if (ReadUInt32(payload, offset) != 3) continue;
+            int end = offset;
+            while (end <= payload.Length - 16 && ReadUInt32(payload, end) == 3)
+            {
+                end += 16;
+            }
+            int intactCount = (end - offset) / 16;
+            uint declaredValue = ReadUInt32(payload, offset - 4);
+            if (declaredValue > 2_000_000)
+            {
+                offset = end - 1;
+                continue;
+            }
+            int declaredCount = (int)declaredValue;
+            if (intactCount >= 1000
+                && declaredCount >= intactCount
+                && declaredCount <= intactCount * 2
+                && (declaredCount & 1) == 0)
+            {
+                int vertexCount = (declaredCount + 4) / 2;
+                int vertexStart = offset - 4 - vertexCount * 24;
+                if (vertexStart >= 0
+                    && Enumerable.Range(0, Math.Min(32, vertexCount))
+                        .All(index => IsPlausible(ReadVertex(payload, vertexStart + index * 24))))
+                {
+                    int readableCount = Math.Min(declaredCount, (payload.Length - offset) / 16);
+                    return (offset - 4, readableCount, vertexCount);
+                }
+            }
+            offset = end - 1;
+        }
+        return null;
+    }
+
     private static double Distance(Vertex a, Vertex b)
     {
         double x = a.X - b.X;
@@ -1047,6 +1242,7 @@ public sealed class AdvToObjConverter
         HashSet<int> repairedVertices = [];
         List<string> warnings = [];
         int repairWindowStart = -1;
+        int reconstructedVertices = 0;
 
         if (missingBytes == 0)
         {
@@ -1057,8 +1253,23 @@ public sealed class AdvToObjConverter
         }
         else
         {
+            int damagedPrefix = 0;
+            while (damagedPrefix < Math.Min(vertexCount - 5, 64)
+                   && !IsPlausible(ReadVertex(payload, vertexStart + damagedPrefix * 24)))
+            {
+                damagedPrefix++;
+            }
+            if (damagedPrefix > 0)
+            {
+                if (damagedPrefix >= 64)
+                {
+                    throw new AdvFormatException("The rough-mesh vertex prefix is too damaged to reconstruct.");
+                }
+                warnings.Add($"Reconstructed {damagedPrefix} damaged leading {(damagedPrefix == 1 ? "vertex" : "vertices")} from adjacent surface points.");
+            }
+
             int split = -1;
-            for (int index = 0; index < vertexCount; index++)
+            for (int index = damagedPrefix; index < vertexCount; index++)
             {
                 Vertex vertex = ReadVertex(payload, vertexStart + index * 24);
                 if (!IsPlausible(vertex))
@@ -1069,9 +1280,11 @@ public sealed class AdvToObjConverter
                 decoded[index] = vertex;
             }
 
-            // Both damaged supplied layouts replace four vertices with a short
-            // proprietary marker. Suffix coordinates remain end-aligned.
-            const int missingVertices = 4;
+            // The original damaged samples replace four vertices with a short
+            // marker. Some later files instead lose a few bytes within one
+            // vertex. In both cases the surviving suffix is end-aligned.
+            int missingVertices = missingBytes <= 24 ? 1 : 4;
+            reconstructedVertices = missingVertices;
             if (split <= 0 || split + missingVertices >= vertexCount
                 || missingVertices * 24 - missingBytes is < 0 or > 64)
             {
@@ -1085,12 +1298,17 @@ public sealed class AdvToObjConverter
             }
 
             InterpolateMissingVertices(decoded, split, missingVertices);
+            if (damagedPrefix > 0)
+            {
+                RepairLeadingVertices(decoded, faces, damagedPrefix);
+                for (int index = 0; index < damagedPrefix; index++) repairedVertices.Add(index);
+            }
             repairWindowStart = split;
             for (int index = split; index < split + missingVertices; index++)
             {
                 repairedVertices.Add(index);
             }
-            warnings.Add($"Reconstructed {missingVertices} vertices from adjacent surface points.");
+            warnings.Add($"Reconstructed {missingVertices} {(missingVertices == 1 ? "vertex" : "vertices")} from adjacent surface points.");
         }
 
         repairedVertices.UnionWith(RepairInvalidCoordinates(decoded));
@@ -1107,9 +1325,9 @@ public sealed class AdvToObjConverter
         {
             warnings.Add($"Repaired {repairedVertices.Count} vertices containing damaged coordinates.");
         }
-        else if (repairedVertices.Count > 4 && warnings.Count > 0)
+        else if (repairedVertices.Count > reconstructedVertices && warnings.Count > 0)
         {
-            warnings.Add($"Repaired coordinates in {repairedVertices.Count - 4} additional vertices.");
+            warnings.Add($"Repaired coordinates in {repairedVertices.Count - reconstructedVertices} additional vertices.");
         }
 
         return (decoded.Select(vertex => vertex!.Value).ToList(), repairedVertices.Count, warnings);
@@ -1118,7 +1336,8 @@ public sealed class AdvToObjConverter
     private static int FindBestVertexStart(byte[] payload, int estimate, int faceStart, int vertexCount)
     {
         int sampleCount = Math.Min(100, vertexCount);
-        int minimum = Math.Max(0, estimate - 16);
+        int sampleOffset = Math.Min(32, Math.Max(0, vertexCount - sampleCount));
+        int minimum = Math.Max(0, estimate);
         int maximum = Math.Min(faceStart - sampleCount * 24, estimate + 128);
         int bestOffset = -1;
         int bestScore = -1;
@@ -1129,7 +1348,7 @@ public sealed class AdvToObjConverter
             int score = 0;
             for (int index = 0; index < sampleCount; index++)
             {
-                if (IsPlausible(ReadVertex(payload, candidate + index * 24)))
+                if (IsPlausible(ReadVertex(payload, candidate + (sampleOffset + index) * 24)))
                 {
                     score++;
                 }
@@ -1148,6 +1367,41 @@ public sealed class AdvToObjConverter
             throw new AdvFormatException("The rough-mesh vertex table could not be located.");
         }
         return bestOffset;
+    }
+
+    private static void RepairLeadingVertices(
+        Vertex?[] vertices, List<(int A, int B, int C)> faces, int count)
+    {
+        List<int>[] neighbours = Enumerable.Range(0, count).Select(_ => new List<int>()).ToArray();
+        foreach ((int a, int b, int c) in faces)
+        {
+            if (a < count) { neighbours[a].Add(b); neighbours[a].Add(c); }
+            if (b < count) { neighbours[b].Add(a); neighbours[b].Add(c); }
+            if (c < count) { neighbours[c].Add(a); neighbours[c].Add(b); }
+        }
+        for (int pass = 0; pass < count; pass++)
+        {
+            bool progressed = false;
+            for (int index = 0; index < count; index++)
+            {
+                if (vertices[index].HasValue) continue;
+                List<Vertex> available = neighbours[index]
+                    .Where(neighbour => vertices[neighbour].HasValue && IsPlausible(vertices[neighbour]!.Value))
+                    .Select(neighbour => vertices[neighbour]!.Value)
+                    .ToList();
+                if (available.Count == 0) continue;
+                vertices[index] = new Vertex(
+                    available.Average(vertex => vertex.X),
+                    available.Average(vertex => vertex.Y),
+                    available.Average(vertex => vertex.Z));
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+        if (vertices.Take(count).Any(vertex => !vertex.HasValue))
+        {
+            throw new AdvFormatException("Damaged leading vertices are disconnected from the surviving rough mesh.");
+        }
     }
 
     private static HashSet<int> RepairInvalidCoordinates(Vertex?[] vertices)
