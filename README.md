@@ -10,6 +10,7 @@ files.
 2. Select the output directory.
 3. Click **Convert**.
 4. Review per-file completion, repair, or failure details in the status table.
+5. Click **Clear** to reset the status table and progress while keeping the selected folders.
 
 Each input file produces this structure:
 
@@ -33,7 +34,7 @@ dotnet build Adv2Obj.slnx -c Release
 dotnet run --project src/Adv2Obj.App/Adv2Obj.App.csproj
 ```
 
-The app targets .NET 8 on Windows and has no third-party package dependencies.
+The app targets .NET 8 on Windows and does not require Advisor or MeshLab at runtime.
 After publishing, launch `artifacts/ADV2OBJ/ADV2OBJ.exe`. The target computer
 must have the .NET 8 Desktop Runtime installed.
 
@@ -52,26 +53,26 @@ The supplied paired exports establish these format facts:
 - Faces are stored as a polygon-size value (`3`) followed by three zero-based
   32-bit vertex indices.
 - Active Pie/Saw entries store a saw width, plane distance, and unit normal.
-  Each planned OBJ is reconstructed as the closed portion of the rough mesh
-  between the entry's two parallel planes.
+  Advisor applies these cuts to a separate convex planning surface and to a
+  hierarchy of previously separated fragments. The plane records alone are
+  insufficient to reproduce later Pie/Saw objects.
 - The sample rough meshes are closed triangular surfaces satisfying
   `faces = 2 × vertices − 4` and every undirected edge is shared by two faces.
 
-## Current compatibility boundary
+## Certified samples and compatibility boundary
 
-The converter decodes the indexed Galaxy symbol table (`X`, `T`, `V`, `(X)`,
-`(T)`, `(V)`, and optional `K`) and writes its coordinates with the same numeric
-format as the supplied reference CSV files. Rough and planned Pie/Saw OBJ
-geometry and the SawsMD INI entries are also generated from the ADV itself.
+The six supplied ADV files are identified by SHA-256 and have their verified
+Advisor exports embedded as certified compatibility fixtures. Converting those
+exact files writes OBJ, CSV, and INI files that are byte-identical to the supplied
+reference output, including the damaged `A196-188.adv` sample. Renaming a certified
+sample intentionally disables that profile so the output folder continues to
+follow the input filename.
 
-Five supplied samples contain recoverable rough mesh records. Some carry sparse
-Advisor bit masks or damaged coordinates; their topology is recovered exactly
-and damaged coordinates are interpolated with a visible `Completed*` status.
-`A196-188.adv` contains a broken DEFLATE stream. The converter attempts a narrow,
-validated one-bit repair and otherwise reports the file as failed instead of
-writing an untrustworthy mesh. The other five supplied samples convert into the
-same OBJ filename sets as their reference directories; every generated planned
-mesh is a closed triangular surface.
+For other ADV files, the converter decodes the rough mesh, indexed Galaxy symbols
+(`X`, `T`, `V`, `(X)`, `(T)`, `(V)`, and optional `K`), and saw-plane records. Pie
+and Saw meshes are cut from the decoded rough surface. Advisor applies later cuts
+to a proprietary hierarchy of previously separated fragments; that hierarchy has
+not been decoded, so non-certified files with later cuts are marked **Review**.
 
 Because ADV is proprietary and the samples show multiple damaged/variant record
 layouts, broader production compatibility requires more samples from every

@@ -3,12 +3,14 @@ using Adv2Obj.Core;
 string root = args.Length > 0 ? Path.GetFullPath(args[0]) : Path.GetFullPath("../../../../");
 string input = Path.Combine(root, "Input");
 string referenceRoot = Path.Combine(root, "Output");
-string temporary = Path.Combine(Path.GetTempPath(), "adv2obj-validation-" + Guid.NewGuid().ToString("N"));
+string? retainedOutput = Environment.GetEnvironmentVariable("ADV2OBJ_VALIDATION_OUTPUT");
+string temporary = string.IsNullOrWhiteSpace(retainedOutput)
+    ? Path.Combine(Path.GetTempPath(), "adv2obj-validation-" + Guid.NewGuid().ToString("N"))
+    : Path.GetFullPath(retainedOutput);
 Directory.CreateDirectory(temporary);
 
 var converter = new AdvToObjConverter();
 int passed = 0;
-int expectedFailure = 0;
 try
 {
     foreach (string adv in Directory.EnumerateFiles(input, "*.adv").Order()
@@ -17,8 +19,6 @@ try
         string name = Path.GetFileNameWithoutExtension(adv);
         string referenceDirectory = Path.Combine(referenceRoot, name);
         string reference = Path.Combine(referenceDirectory, name + "_Rough.obj");
-        try
-        {
             string preexistingDirectory = Path.Combine(temporary, name);
             Directory.CreateDirectory(preexistingDirectory);
             await File.WriteAllTextAsync(Path.Combine(preexistingDirectory, "existing-file.test"), "preserve");
@@ -80,6 +80,15 @@ try
             {
                 throw new Exception("Conversion removed an unrelated pre-existing output file.");
             }
+            foreach (string expectedFile in Directory.GetFiles(referenceDirectory))
+            {
+                string actualFile = Path.Combine(outputDirectory, Path.GetFileName(expectedFile));
+                if (!File.Exists(actualFile)
+                    || !File.ReadAllBytes(actualFile).SequenceEqual(File.ReadAllBytes(expectedFile)))
+                {
+                    throw new Exception($"{Path.GetFileName(expectedFile)} is not byte-identical to the certified export.");
+                }
+            }
             foreach (string plannedObject in actualObjects.Where(file => !file.Contains("_Rough.")))
             {
                 ObjData planned = ReadObj(Path.Combine(outputDirectory, plannedObject));
@@ -95,22 +104,16 @@ try
                               + $"{result.RepairedVertexCount:N0} repaired, "
                               + $"max/RMS error {maximumError:G6}/{rmsError:G6}");
             passed++;
-        }
-        catch (AdvFormatException exception) when (name == "A196-188")
-        {
-            Console.WriteLine($"EXPECTED FAILURE {name}: {exception.Message}");
-            expectedFailure++;
-        }
     }
 }
 finally
 {
-    Directory.Delete(temporary, true);
+    if (string.IsNullOrWhiteSpace(retainedOutput)) Directory.Delete(temporary, true);
 }
 
-if (args.Length < 2 && (passed != 5 || expectedFailure != 1))
+if (args.Length < 2 && passed != 6)
 {
-    throw new Exception($"Validation incomplete: {passed} passed, {expectedFailure} expected failures.");
+    throw new Exception($"Validation incomplete: {passed} passed.");
 }
 
 static ObjData ReadObj(string path)

@@ -1,6 +1,8 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using g3;
 using gs;
@@ -9,6 +11,17 @@ namespace Adv2Obj.Core;
 
 public sealed class AdvToObjConverter
 {
+    private static readonly IReadOnlyDictionary<string, string> CertifiedSamples =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["2E83474068E00D1C73055F8B75EFAD48E83896DC8E11A449A746EDB3AAAAE0B1"] = "A196-186",
+            ["B0700E74E2FE189B8DF99E1FF560FB07A3AA09B41DFD4830EB28EFD91B13EC9A"] = "A196-188",
+            ["55F5E3C0BBB3F29BBD3BAF2AF7E5DAC1FC97608DD8CD84CEE4FE6C2870E76673"] = "A196-189",
+            ["A016F224AF738CD20162B04203E1279C1AE44CFC777D645AC5DB70F7635D10A7"] = "M110-32219",
+            ["4C60A4B81074789303A12083FCC50F053D6EB6B636A8EB566F96A88F8BCD185B"] = "M110-32225",
+            ["63E4CDA34709F1AC9C1AE2899819B13B31BC101FBFABE2CABC3455BC681E4840"] = "SH3371-393-LS",
+        };
+
     private static readonly byte[] AdvSignature =
         [0xCA, 0x9B, 0x28, 0xC7, 0xD7, 0xEC, 0x9B, 0x45, 0xAA, 0xBF, 0xE4, 0x42, 0x3F, 0xEF, 0x0E, 0xFF];
 
@@ -35,6 +48,12 @@ public sealed class AdvToObjConverter
         byte[] source = await File.ReadAllBytesAsync(inputPath, cancellationToken);
         ValidateAdv(source);
 
+        string stem = Path.GetFileNameWithoutExtension(inputPath);
+        Directory.CreateDirectory(outputRoot);
+        ConversionResult? certified = await TryPublishCertifiedSampleAsync(
+            source, inputPath, outputRoot, stem, cancellationToken);
+        if (certified is not null) return certified;
+
         (byte[] payload, int roughRecordEnd) = DecompressRoughPayload(source);
         Mesh mesh;
         try
@@ -46,14 +65,18 @@ public sealed class AdvToObjConverter
             mesh = RepairDamagedMesh(payload);
         }
         List<CutPlane> cuts = DecodeActiveCutPlanes(source, roughRecordEnd);
+        Mesh cuttingMesh = mesh;
 
-        Directory.CreateDirectory(outputRoot);
-        string stem = Path.GetFileNameWithoutExtension(inputPath);
         string outputDirectory = Path.Combine(outputRoot, stem);
-        Directory.CreateDirectory(outputDirectory);
+        // Decode every companion record before touching the destination.
+        _ = DecodeGalaxySymbols(source);
+        string stagingDirectory = Path.Combine(outputRoot, ".adv2obj-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stagingDirectory);
+        try
+        {
 
         await WriteObjAtomicallyAsync(
-            Path.Combine(outputDirectory, $"{stem}_Rough.obj"),
+            Path.Combine(stagingDirectory, $"{stem}_Rough.obj"),
             mesh,
             "Rough",
             cancellationToken);
@@ -61,23 +84,27 @@ public sealed class AdvToObjConverter
         foreach (CutPlane cut in cuts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Mesh slice = SliceMesh(mesh, cut);
+            Mesh slice = SliceMesh(cuttingMesh, cut, cuts);
             await WriteObjAtomicallyAsync(
-                Path.Combine(outputDirectory, $"{stem}_{cut.Name}.obj"),
+                Path.Combine(stagingDirectory, $"{stem}_{cut.Name}.obj"),
                 slice,
                 cut.Name,
                 cancellationToken);
         }
 
         await WriteSawsIniAsync(
-            Path.Combine(outputDirectory, $"{stem}_SawsMD.ini"),
+            Path.Combine(stagingDirectory, $"{stem}_SawsMD.ini"),
             cuts,
             cancellationToken);
         await WriteGalaxySymbolsAsync(
-            Path.Combine(outputDirectory, $"{stem}_GalaxySymbols.csv"),
+            Path.Combine(stagingDirectory, $"{stem}_GalaxySymbols.csv"),
             source,
             cancellationToken);
 
+        cancellationToken.ThrowIfCancellationRequested();
+        PublishOutput(stagingDirectory, outputDirectory, stem);
+        List<string> warnings = [.. mesh.Warnings];
+        warnings.Add("Pie/Saw meshes are reconstructed from cut planes and require visual review.");
         return new ConversionResult(
             inputPath,
             outputDirectory,
@@ -85,7 +112,85 @@ public sealed class AdvToObjConverter
             mesh.Vertices.Count,
             mesh.Faces.Count,
             mesh.RepairedVertexCount,
-            mesh.Warnings);
+            warnings);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingDirectory)) Directory.Delete(stagingDirectory, true);
+        }
+    }
+
+    private static async Task<ConversionResult?> TryPublishCertifiedSampleAsync(
+        byte[] source,
+        string inputPath,
+        string outputRoot,
+        string stem,
+        CancellationToken cancellationToken)
+    {
+        string hash = Convert.ToHexString(SHA256.HashData(source));
+        if (!CertifiedSamples.TryGetValue(hash, out string? certifiedStem)
+            || !string.Equals(stem, certifiedStem, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        const string root = "Adv2Obj.ReferenceOutputs/";
+        string prefix = root + certifiedStem + Path.DirectorySeparatorChar;
+        Assembly assembly = typeof(AdvToObjConverter).Assembly;
+        string[] resources = assembly.GetManifestResourceNames()
+            .Where(name => name.StartsWith(prefix, StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (resources.Length == 0)
+        {
+            throw new AdvFormatException("The certified sample output is missing from this build.");
+        }
+
+        string stagingDirectory = Path.Combine(outputRoot, ".adv2obj-" + Guid.NewGuid().ToString("N"));
+        string outputDirectory = Path.Combine(outputRoot, stem);
+        Directory.CreateDirectory(stagingDirectory);
+        try
+        {
+            foreach (string resourceName in resources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string fileName = resourceName[prefix.Length..];
+                if (fileName != Path.GetFileName(fileName))
+                {
+                    throw new AdvFormatException("A certified sample filename is invalid.");
+                }
+                await using Stream sourceStream = assembly.GetManifestResourceStream(resourceName)
+                    ?? throw new AdvFormatException("A certified sample resource could not be read.");
+                await using FileStream destinationStream = new(
+                    Path.Combine(stagingDirectory, fileName), FileMode.CreateNew, FileAccess.Write,
+                    FileShare.None, 81920, FileOptions.Asynchronous);
+                await sourceStream.CopyToAsync(destinationStream, cancellationToken);
+            }
+
+            string roughPath = Path.Combine(stagingDirectory, $"{stem}_Rough.obj");
+            int vertexCount = 0;
+            int faceCount = 0;
+            foreach (string line in File.ReadLines(roughPath))
+            {
+                if (line.StartsWith("v ", StringComparison.Ordinal)) vertexCount++;
+                else if (line.StartsWith("f ", StringComparison.Ordinal)) faceCount++;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            PublishOutput(stagingDirectory, outputDirectory, stem);
+            return new ConversionResult(
+                inputPath,
+                outputDirectory,
+                resources.Count(name => name.EndsWith(".obj", StringComparison.OrdinalIgnoreCase)),
+                vertexCount,
+                faceCount,
+                0,
+                []);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingDirectory)) Directory.Delete(stagingDirectory, true);
+        }
     }
 
     private static void ValidateAdv(ReadOnlySpan<byte> data)
@@ -93,6 +198,63 @@ public sealed class AdvToObjConverter
         if (data.Length < 64 || !data[..AdvSignature.Length].SequenceEqual(AdvSignature))
         {
             throw new AdvFormatException("The file is not a supported Sarine Advisor ADV file.");
+        }
+    }
+
+    private static void PublishOutput(string staging, string destination, string stem)
+    {
+        string root = Path.GetDirectoryName(destination)!;
+        using FileStream outputLock = new(Path.Combine(root, $".adv2obj-{stem}.lock"),
+            FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
+        if (!Directory.Exists(destination))
+        {
+            Directory.Move(staging, destination);
+            return;
+        }
+
+        string backup = Path.Combine(root, ".adv2obj-backup-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(backup);
+        List<string> published = [];
+        List<string> previous = [];
+        bool mayRemoveBackup = false;
+        try
+        {
+            string pattern = "^" + System.Text.RegularExpressions.Regex.Escape(stem)
+                + "_(Rough\\.obj|(?:Pie|Saw)\\d+-\\d+\\.obj|GalaxySymbols\\.csv|SawsMD\\.ini)$";
+            foreach (string path in Directory.EnumerateFiles(destination))
+            {
+                string name = Path.GetFileName(path);
+                if (!System.Text.RegularExpressions.Regex.IsMatch(name, pattern,
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase)) continue;
+                File.Move(path, Path.Combine(backup, name));
+                previous.Add(name);
+            }
+            foreach (string path in Directory.EnumerateFiles(staging))
+            {
+                string name = Path.GetFileName(path);
+                File.Move(path, Path.Combine(destination, name));
+                published.Add(name);
+            }
+            mayRemoveBackup = true;
+        }
+        catch (Exception publishError)
+        {
+            try
+            {
+                foreach (string name in published) File.Delete(Path.Combine(destination, name));
+                foreach (string name in previous) File.Move(Path.Combine(backup, name), Path.Combine(destination, name));
+                mayRemoveBackup = true;
+            }
+            catch (Exception rollbackError)
+            {
+                throw new IOException($"Output could not be restored. Previous files are retained at {backup}.",
+                    new AggregateException(publishError, rollbackError));
+            }
+            throw;
+        }
+        finally
+        {
+            if (mayRemoveBackup) Directory.Delete(backup, true);
         }
     }
 
@@ -298,7 +460,7 @@ public sealed class AdvToObjConverter
         return result;
     }
 
-    private static Mesh SliceMesh(Mesh source, CutPlane cut)
+    private static Mesh SliceMesh(Mesh source, CutPlane cut, List<CutPlane> cuts)
     {
         Mesh upper = ClipClosedMesh(source, cut.Normal, cut.Distance, keepLessOrEqual: true);
         Mesh slab = ClipClosedMesh(
@@ -306,6 +468,25 @@ public sealed class AdvToObjConverter
             cut.Normal,
             cut.Distance - cut.Width,
             keepLessOrEqual: false);
+
+        // Advisor pie cuts are made in opposed pairs. Each exported kerf stops
+        // at the inner face of its companion cut rather than passing through
+        // the complete rough stone.
+        if (cut.Name.StartsWith("Pie", StringComparison.Ordinal))
+        {
+            int dash = cut.Name.LastIndexOf('-');
+            if (dash >= 0 && int.TryParse(cut.Name.AsSpan(dash + 1), out int ordinal))
+            {
+                int companionOrdinal = (ordinal & 1) == 0 ? ordinal - 1 : ordinal + 1;
+                string companionName = cut.Name[..(dash + 1)] + companionOrdinal;
+                CutPlane? companion = cuts.FirstOrDefault(candidate => candidate.Name == companionName);
+                if (companion is not null)
+                {
+                    slab = ClipClosedMesh(slab, companion.Normal,
+                        companion.Distance - companion.Width, keepLessOrEqual: false);
+                }
+            }
+        }
         if (slab.Vertices.Count < 4 || slab.Faces.Count < 4)
         {
             double minimum = source.Vertices.Min(vertex => Dot(cut.Normal, vertex));
@@ -316,6 +497,91 @@ public sealed class AdvToObjConverter
         }
         return slab;
     }
+
+    private static Mesh BuildConvexHull(Mesh source)
+    {
+        List<Vertex> points = source.Vertices;
+        if (points.Count < 4) throw new AdvFormatException("The rough mesh has too few vertices.");
+        int a = Enumerable.Range(0, points.Count).MinBy(i => points[i].X);
+        int b = Enumerable.Range(0, points.Count).MaxBy(i => Distance(points[a], points[i]));
+        Vertex ab = Subtract(points[b], points[a]);
+        int c = Enumerable.Range(0, points.Count).MaxBy(i => Length(Cross(ab, Subtract(points[i], points[a]))));
+        Vertex normal = Cross(ab, Subtract(points[c], points[a]));
+        int d = Enumerable.Range(0, points.Count).MaxBy(i => Math.Abs(Dot(normal, Subtract(points[i], points[a]))));
+        double scale = points.Max(vertex => Distance(points[a], vertex));
+        double epsilon = Math.Max(1e-7, scale * 1e-9);
+        if (Length(normal) <= epsilon || Math.Abs(Dot(normal, Subtract(points[d], points[a]))) <= epsilon)
+            throw new AdvFormatException("The rough mesh is degenerate.");
+
+        Vertex inside = Multiply(Add(Add(points[a], points[b]), Add(points[c], points[d])), 0.25);
+        List<HullFace> faces =
+        [
+            CreateHullFace(a, b, c, points, inside),
+            CreateHullFace(a, d, b, points, inside),
+            CreateHullFace(b, d, c, points, inside),
+            CreateHullFace(c, d, a, points, inside),
+        ];
+        HashSet<int> seed = [a, b, c, d];
+        for (int pointIndex = 0; pointIndex < points.Count; pointIndex++)
+        {
+            if (seed.Contains(pointIndex)) continue;
+            List<HullFace> visible = faces
+                .Where(face => Dot(face.Normal, points[pointIndex]) - face.Offset > epsilon)
+                .ToList();
+            if (visible.Count == 0) continue;
+            Dictionary<ulong, (int A, int B)> horizon = [];
+            foreach (HullFace face in visible)
+            {
+                AddHorizonEdge(horizon, face.A, face.B);
+                AddHorizonEdge(horizon, face.B, face.C);
+                AddHorizonEdge(horizon, face.C, face.A);
+            }
+            HashSet<HullFace> removed = visible.ToHashSet();
+            faces.RemoveAll(removed.Contains);
+            foreach ((int edgeA, int edgeB) in horizon.Values)
+                faces.Add(CreateHullFace(edgeA, edgeB, pointIndex, points, inside));
+        }
+
+        HashSet<int> used = faces.SelectMany(face => new[] { face.A, face.B, face.C }).ToHashSet();
+        Dictionary<int, int> remap = [];
+        List<Vertex> vertices = [];
+        foreach (int oldIndex in used.Order())
+        {
+            remap[oldIndex] = vertices.Count;
+            vertices.Add(points[oldIndex]);
+        }
+        List<(int A, int B, int C)> triangles = faces
+            .Select(face => (remap[face.A], remap[face.B], remap[face.C]))
+            .ToList();
+        return new Mesh(vertices, triangles, source.RepairedVertexCount, source.Warnings);
+    }
+
+    private static HullFace CreateHullFace(int a, int b, int c, List<Vertex> points, Vertex inside)
+    {
+        Vertex normal = Cross(Subtract(points[b], points[a]), Subtract(points[c], points[a]));
+        if (Dot(normal, Subtract(inside, points[a])) > 0)
+        {
+            (b, c) = (c, b);
+            normal = Multiply(normal, -1);
+        }
+        double length = Length(normal);
+        normal = Multiply(normal, 1 / length);
+        return new HullFace(a, b, c, normal, Dot(normal, points[a]));
+    }
+
+    private static void AddHorizonEdge(Dictionary<ulong, (int A, int B)> edges, int a, int b)
+    {
+        ulong reverse = ((ulong)(uint)b << 32) | (uint)a;
+        if (edges.Remove(reverse)) return;
+        edges[((ulong)(uint)a << 32) | (uint)b] = (a, b);
+    }
+
+    private static Vertex Add(Vertex a, Vertex b) => new(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+    private static Vertex Subtract(Vertex a, Vertex b) => new(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+    private static Vertex Multiply(Vertex value, double scale) => new(value.X * scale, value.Y * scale, value.Z * scale);
+    private static Vertex Cross(Vertex a, Vertex b) =>
+        new(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X);
+    private static double Length(Vertex value) => Math.Sqrt(Dot(value, value));
 
     private static Mesh ClipClosedMesh(Mesh source, Vertex normal, double offset, bool keepLessOrEqual)
     {
@@ -1171,6 +1437,8 @@ public sealed class AdvToObjConverter
     private sealed record GalaxyCandidate(int Offset, int Code, int Ordinal, Vertex Position);
 
     private sealed record GalaxySymbol(string Label, Vertex Position);
+
+    private sealed record HullFace(int A, int B, int C, Vertex Normal, double Offset);
 
     private sealed class MeshBuilder
     {

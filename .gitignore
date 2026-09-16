@@ -3,6 +3,8 @@
 *.user
 *.suo
 .vs/
+__pycache__/
+*.pyc
 /Input
 /Output
 /artifacts

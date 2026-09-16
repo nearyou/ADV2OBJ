@@ -9,6 +9,7 @@ namespace Adv2Obj.App;
 public partial class MainWindow : Window
 {
     private readonly AdvToObjConverter _converter = new();
+    private CancellationTokenSource? _conversionCancellation;
     public ObservableCollection<FileConversionItem> Files { get; } = [];
 
     public MainWindow()
@@ -82,46 +83,88 @@ public partial class MainWindow : Window
             return;
         }
 
-        Directory.CreateDirectory(OutputFolderTextBox.Text);
+        string outputFolder = OutputFolderTextBox.Text;
+        Directory.CreateDirectory(outputFolder);
         RefreshFileList();
         if (Files.Count == 0) return;
 
         ConvertButton.IsEnabled = false;
+        ClearButton.IsEnabled = false;
+        CancelButton.IsEnabled = true;
+        InputControls.IsEnabled = false;
+        OutputControls.IsEnabled = false;
+        _conversionCancellation = new CancellationTokenSource();
+        CancellationToken cancellationToken = _conversionCancellation.Token;
         ConversionProgress.Maximum = Files.Count;
         ConversionProgress.Value = 0;
         int succeeded = 0;
         int failed = 0;
 
-        foreach (FileConversionItem item in Files)
+        try
         {
-            item.Status = "Converting";
-            item.Details = string.Empty;
-            try
+            foreach (FileConversionItem item in Files)
             {
-                ConversionResult result = await _converter.ConvertAsync(item.InputPath, OutputFolderTextBox.Text);
-                succeeded++;
-                item.Status = result.Warnings.Count == 0 ? "Completed" : "Completed*";
-                item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
-                if (result.RepairedVertexCount > 0)
+                item.Status = "Converting";
+                item.Details = string.Empty;
+                try
                 {
-                    item.Details += $"; {result.RepairedVertexCount:N0} repaired";
+                    string inputPath = item.InputPath;
+                    ConversionResult result = await Task.Run(
+                        () => _converter.ConvertAsync(inputPath, outputFolder, cancellationToken),
+                        cancellationToken);
+                    succeeded++;
+                    item.Status = result.Warnings.Count == 0 ? "Completed" : "Review";
+                    item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
+                    if (result.RepairedVertexCount > 0)
+                    {
+                        item.Details += $"; {result.RepairedVertexCount:N0} repaired";
+                    }
+                    if (result.Warnings.Count > 0)
+                    {
+                        item.Details += "; " + string.Join(" ", result.Warnings);
+                    }
                 }
-                if (result.Warnings.Count > 0)
+                catch (OperationCanceledException)
                 {
-                    item.Details += "; " + string.Join(" ", result.Warnings);
+                    item.Status = "Cancelled";
+                    item.Details = "Conversion cancelled; existing output was preserved.";
+                    break;
                 }
+                catch (Exception exception)
+                {
+                    failed++;
+                    item.Status = "Failed";
+                    item.Details = $"{exception.GetType().Name}: {exception.Message}";
+                }
+                ConversionProgress.Value++;
+                SummaryText.Text = $"Converted {succeeded:N0}; failed {failed:N0}; "
+                                   + $"processed {ConversionProgress.Value:N0} of {Files.Count:N0}.";
             }
-            catch (Exception exception) when (exception is AdvFormatException or IOException or UnauthorizedAccessException)
-            {
-                failed++;
-                item.Status = "Failed";
-                item.Details = exception.Message;
-            }
-            ConversionProgress.Value++;
-            SummaryText.Text = $"Converted {succeeded:N0}; failed {failed:N0}; "
-                               + $"processed {ConversionProgress.Value:N0} of {Files.Count:N0}.";
         }
+        finally
+        {
+            _conversionCancellation?.Dispose();
+            _conversionCancellation = null;
+            ConvertButton.IsEnabled = true;
+            ClearButton.IsEnabled = true;
+            CancelButton.IsEnabled = false;
+            InputControls.IsEnabled = true;
+            OutputControls.IsEnabled = true;
+        }
+    }
 
-        ConvertButton.IsEnabled = true;
+    private void Cancel_Click(object sender, RoutedEventArgs e)
+    {
+        CancelButton.IsEnabled = false;
+        SummaryText.Text = "Cancelling after the current operation…";
+        _conversionCancellation?.Cancel();
+    }
+
+    private void Clear_Click(object sender, RoutedEventArgs e)
+    {
+        Files.Clear();
+        ConversionProgress.Maximum = 1;
+        ConversionProgress.Value = 0;
+        SummaryText.Text = "History cleared. Click Convert to scan the selected input folder again.";
     }
 }

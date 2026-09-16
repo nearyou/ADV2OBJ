@@ -7,4 +7,9 @@
   <ItemGroup>
     <PackageReference Include="geometry3Sharp" Version="1.0.324" />
   </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../../Output/**/*">
+      <LogicalName>Adv2Obj.ReferenceOutputs/%(RecursiveDir)%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
 </Project>

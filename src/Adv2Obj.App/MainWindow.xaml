@@ -33,7 +33,7 @@
                        Margin="0,6,0,0" FontSize="14" Foreground="#5D6B82" />
         </StackPanel>
 
-        <Grid Grid.Row="1" Margin="0,0,0,12">
+        <Grid x:Name="InputControls" Grid.Row="1" Margin="0,0,0,12">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="115" />
                 <ColumnDefinition Width="*" />
@@ -44,7 +44,7 @@
             <Button Grid.Column="2" Content="Browse…" Click="BrowseInput_Click" />
         </Grid>
 
-        <Grid Grid.Row="2" Margin="0,0,0,18">
+        <Grid x:Name="OutputControls" Grid.Row="2" Margin="0,0,0,18">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="115" />
                 <ColumnDefinition Width="*" />
@@ -59,12 +59,18 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
             <ProgressBar x:Name="ConversionProgress" Height="18" Minimum="0" Maximum="1"
                          VerticalAlignment="Center" Foreground="#3167E3" />
             <Button x:Name="ConvertButton" Grid.Column="1" Margin="18,0,0,0"
                     MinWidth="130" Content="Convert" Foreground="White" Background="#3167E3"
                     BorderBrush="#2857C5" Click="Convert_Click" />
+            <Button x:Name="CancelButton" Grid.Column="2" Margin="8,0,0,0"
+                    Content="Cancel" IsEnabled="False" Click="Cancel_Click" />
+            <Button x:Name="ClearButton" Grid.Column="3" Margin="8,0,0,0"
+                    Content="Clear" Click="Clear_Click" />
         </Grid>
 
         <Border Grid.Row="4" Background="White" BorderBrush="#D9E0EC" BorderThickness="1" CornerRadius="6">
