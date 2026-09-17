@@ -1,8 +1,6 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
-using System.Reflection;
-using System.Security.Cryptography;
 using System.Text;
 using g3;
 using gs;
@@ -11,22 +9,13 @@ namespace Adv2Obj.Core;
 
 public sealed class AdvToObjConverter
 {
-    private static readonly IReadOnlyDictionary<string, string> CertifiedSamples =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["2E83474068E00D1C73055F8B75EFAD48E83896DC8E11A449A746EDB3AAAAE0B1"] = "A196-186",
-            ["B0700E74E2FE189B8DF99E1FF560FB07A3AA09B41DFD4830EB28EFD91B13EC9A"] = "A196-188",
-            ["55F5E3C0BBB3F29BBD3BAF2AF7E5DAC1FC97608DD8CD84CEE4FE6C2870E76673"] = "A196-189",
-            ["A016F224AF738CD20162B04203E1279C1AE44CFC777D645AC5DB70F7635D10A7"] = "M110-32219",
-            ["4C60A4B81074789303A12083FCC50F053D6EB6B636A8EB566F96A88F8BCD185B"] = "M110-32225",
-            ["63E4CDA34709F1AC9C1AE2899819B13B31BC101FBFABE2CABC3455BC681E4840"] = "SH3371-393-LS",
-        };
-
     private static readonly byte[] AdvSignature =
         [0xCA, 0x9B, 0x28, 0xC7, 0xD7, 0xEC, 0x9B, 0x45, 0xAA, 0xBF, 0xE4, 0x42, 0x3F, 0xEF, 0x0E, 0xFF];
 
     private static readonly byte[] ZipSignature = [0x50, 0x4B, 0x03, 0x04];
     private static readonly byte[] ZippedDataName = Encoding.ASCII.GetBytes("ZippedData");
+    private static readonly byte[] GalaxyTableSignature =
+        [0xF3, 0x6B, 0xED, 0x43, 0xB3, 0x32, 0xFA, 0x60, 0x7E, 0xE3, 0x55, 0x1D];
 
     // Sparse bit masks observed in the supplied Advisor data. XOR removes the
     // mask while retaining the original triangle index.
@@ -79,13 +68,28 @@ public sealed class AdvToObjConverter
 
         string stem = Path.GetFileNameWithoutExtension(inputPath);
         Directory.CreateDirectory(outputRoot);
-        ConversionResult? certified = await TryPublishCertifiedSampleAsync(
-            source, inputPath, outputRoot, stem, cancellationToken);
-        if (certified is not null) return certified;
-
-        (byte[] payload, int roughRecordEnd, bool alternateRawMesh) = DecompressRoughPayload(source);
-        Mesh mesh;
+        byte[] payload = [];
+        int roughRecordEnd = checked((int)ReadUInt32(source, 0x34));
+        bool alternateRawMesh = false;
+        Mesh? recoveredFromInflate = null;
         try
+        {
+            (payload, roughRecordEnd, alternateRawMesh) = DecompressRoughPayload(source);
+        }
+        catch (AdvFormatException primaryError)
+        {
+            recoveredFromInflate = FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                ?? throw new AdvFormatException(
+                    $"{primaryError.Message} No complete alternate mesh was found.");
+            recoveredFromInflate.Warnings.Add(
+                "Primary rough mesh cannot be decompressed; recovered a closed alternate mesh from the ADV. Verify its shape in MeshLab.");
+        }
+        Mesh mesh;
+        if (recoveredFromInflate is not null)
+        {
+            mesh = recoveredFromInflate;
+        }
+        else try
         {
             mesh = DecodeMesh(payload);
         }
@@ -122,11 +126,25 @@ public sealed class AdvToObjConverter
                 "Primary uncompressed rough mesh is damaged; recovered a later closed mesh from the ADV. Verify its shape in MeshLab.");
         }
         List<CutPlane> cuts = DecodeActiveCutPlanes(source, roughRecordEnd);
+        if (cuts.Count == 0)
+        {
+            mesh.Warnings.Add("No Pie/Saw cutting plan is present; exported the rough mesh only.");
+        }
         Mesh cuttingMesh = mesh;
 
         string outputDirectory = Path.Combine(outputRoot, stem);
         // Decode every companion record before touching the destination.
-        _ = DecodeGalaxySymbols(source);
+        List<GalaxySymbol> symbols = DecodeGalaxySymbols(source);
+        int repairedSymbols = symbols.Count(symbol => symbol.Repaired);
+        if (repairedSymbols > 0)
+        {
+            mesh.Warnings.Add(
+                $"Recovered {repairedSymbols:N0} Galaxy symbol {(repairedSymbols == 1 ? "record" : "records")} from shifted bytes; reduced precision requires visual review.");
+        }
+        if (symbols.Count == 5 && HasInactiveGalaxySlot(source))
+        {
+            mesh.Warnings.Add("One inactive Galaxy symbol slot was omitted from the CSV.");
+        }
         string stagingDirectory = Path.Combine(outputRoot, ".adv2obj-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(stagingDirectory);
         try
@@ -155,13 +173,16 @@ public sealed class AdvToObjConverter
             cancellationToken);
         await WriteGalaxySymbolsAsync(
             Path.Combine(stagingDirectory, $"{stem}_GalaxySymbols.csv"),
-            source,
+            symbols,
             cancellationToken);
 
         cancellationToken.ThrowIfCancellationRequested();
         PublishOutput(stagingDirectory, outputDirectory, stem);
         List<string> warnings = [.. mesh.Warnings];
-        warnings.Add("Pie/Saw meshes are reconstructed from cut planes and require visual review.");
+        if (cuts.Count > 0)
+        {
+            warnings.Add("Pie/Saw meshes are reconstructed from cut planes and require visual review.");
+        }
         return new ConversionResult(
             inputPath,
             outputDirectory,
@@ -170,79 +191,6 @@ public sealed class AdvToObjConverter
             mesh.Faces.Count,
             mesh.RepairedVertexCount,
             warnings);
-        }
-        finally
-        {
-            if (Directory.Exists(stagingDirectory)) Directory.Delete(stagingDirectory, true);
-        }
-    }
-
-    private static async Task<ConversionResult?> TryPublishCertifiedSampleAsync(
-        byte[] source,
-        string inputPath,
-        string outputRoot,
-        string stem,
-        CancellationToken cancellationToken)
-    {
-        string hash = Convert.ToHexString(SHA256.HashData(source));
-        if (!CertifiedSamples.TryGetValue(hash, out string? certifiedStem)
-            || !string.Equals(stem, certifiedStem, StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-
-        const string root = "Adv2Obj.ReferenceOutputs/";
-        string prefix = root + certifiedStem + Path.DirectorySeparatorChar;
-        Assembly assembly = typeof(AdvToObjConverter).Assembly;
-        string[] resources = assembly.GetManifestResourceNames()
-            .Where(name => name.StartsWith(prefix, StringComparison.Ordinal))
-            .Order(StringComparer.Ordinal)
-            .ToArray();
-        if (resources.Length == 0)
-        {
-            throw new AdvFormatException("The certified sample output is missing from this build.");
-        }
-
-        string stagingDirectory = Path.Combine(outputRoot, ".adv2obj-" + Guid.NewGuid().ToString("N"));
-        string outputDirectory = Path.Combine(outputRoot, stem);
-        Directory.CreateDirectory(stagingDirectory);
-        try
-        {
-            foreach (string resourceName in resources)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                string fileName = resourceName[prefix.Length..];
-                if (fileName != Path.GetFileName(fileName))
-                {
-                    throw new AdvFormatException("A certified sample filename is invalid.");
-                }
-                await using Stream sourceStream = assembly.GetManifestResourceStream(resourceName)
-                    ?? throw new AdvFormatException("A certified sample resource could not be read.");
-                await using FileStream destinationStream = new(
-                    Path.Combine(stagingDirectory, fileName), FileMode.CreateNew, FileAccess.Write,
-                    FileShare.None, 81920, FileOptions.Asynchronous);
-                await sourceStream.CopyToAsync(destinationStream, cancellationToken);
-            }
-
-            string roughPath = Path.Combine(stagingDirectory, $"{stem}_Rough.obj");
-            int vertexCount = 0;
-            int faceCount = 0;
-            foreach (string line in File.ReadLines(roughPath))
-            {
-                if (line.StartsWith("v ", StringComparison.Ordinal)) vertexCount++;
-                else if (line.StartsWith("f ", StringComparison.Ordinal)) faceCount++;
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-            PublishOutput(stagingDirectory, outputDirectory, stem);
-            return new ConversionResult(
-                inputPath,
-                outputDirectory,
-                resources.Count(name => name.EndsWith(".obj", StringComparison.OrdinalIgnoreCase)),
-                vertexCount,
-                faceCount,
-                0,
-                []);
         }
         finally
         {
@@ -576,12 +524,13 @@ public sealed class AdvToObjConverter
                 double magnitude = Math.Sqrt(Dot(normal, normal));
                 if (width is < 1 or > 500
                     || !double.IsFinite(distance) || Math.Abs(distance) > 10_000_000
-                    || Math.Abs(magnitude - 1) > 1e-5)
+                    || Math.Abs(magnitude - 1) > 0.02)
                 {
                     continue;
                 }
 
-                decoded = new CutPlane(name, planNumber, width, distance, normal);
+                decoded = new CutPlane(name, planNumber, width, distance,
+                    Multiply(normal, 1 / magnitude));
                 break;
             }
             if (decoded is not null)
@@ -593,6 +542,10 @@ public sealed class AdvToObjConverter
 
         if (candidates.Count == 0)
         {
+            if (!ContainsNamedCut(source))
+            {
+                return [];
+            }
             throw new AdvFormatException("The active Pie/Saw cutting plan was not found.");
         }
 
@@ -607,6 +560,20 @@ public sealed class AdvToObjConverter
             throw new AdvFormatException("The active Pie/Saw cutting plan is empty.");
         }
         return result;
+    }
+
+    private static bool ContainsNamedCut(byte[] source)
+    {
+        for (int offset = 0; offset < source.Length - 6; offset++)
+        {
+            if (!source.AsSpan(offset, 3).SequenceEqual("Pie"u8)
+                && !source.AsSpan(offset, 3).SequenceEqual("Saw"u8)) continue;
+            int current = offset + 3;
+            while (current < source.Length && source[current] is >= (byte)'0' and <= (byte)'9') current++;
+            if (current == offset + 3 || current >= source.Length || source[current++] != (byte)'-') continue;
+            if (current < source.Length && source[current] is >= (byte)'0' and <= (byte)'9') return true;
+        }
+        return false;
     }
 
     private static Mesh SliceMesh(Mesh source, CutPlane cut, List<CutPlane> cuts)
@@ -830,10 +797,9 @@ public sealed class AdvToObjConverter
 
     private static Task WriteGalaxySymbolsAsync(
         string path,
-        byte[] source,
+        List<GalaxySymbol> symbols,
         CancellationToken token)
     {
-        List<GalaxySymbol> symbols = DecodeGalaxySymbols(source);
         string contents = string.Join(
             Environment.NewLine,
             symbols.Select(symbol => string.Create(
@@ -865,7 +831,8 @@ public sealed class AdvToObjConverter
             if (code > 20 || ordinal >= labels.Length) continue;
 
             int coordinateOffset;
-            if (variant <= 1 && reserved == 0)
+            if ((variant == 0 && reserved == 0)
+                || (variant == 1 && reserved <= 1))
             {
                 coordinateOffset = offset + 16;
             }
@@ -890,9 +857,11 @@ public sealed class AdvToObjConverter
         if (required is null)
         {
             // A valid Galaxy table can contain fewer than six entries. Its
-            // 32-bit count precedes contiguous 80-byte variant-2 records.
-            // Validate the complete table instead of inventing missing labels.
-            required = FindCountedGalaxyTable(source, candidates);
+            // signature and count identify the complete set when present.
+            required = FindGuidGalaxyTable(source, candidates)
+                ?? FindCountedGalaxyTable(source, candidates)
+                ?? FindShiftedVariant2GalaxyTable(source)
+                ?? FindGalaxyTableWithInactiveSlot(source, candidates);
             if (required is null)
             {
                 throw new AdvFormatException("The Galaxy symbol coordinate table was not found.");
@@ -913,7 +882,8 @@ public sealed class AdvToObjConverter
 
         return required
             .OrderBy(candidate => candidate.Ordinal)
-            .Select(candidate => new GalaxySymbol(labels[candidate.Ordinal], candidate.Position))
+            .Select(candidate => new GalaxySymbol(labels[candidate.Ordinal], candidate.Position,
+                candidate.Repaired))
             .ToList();
     }
 
@@ -927,7 +897,7 @@ public sealed class AdvToObjConverter
         {
             if (first.Offset < 4) continue;
             uint count = ReadUInt32(source, first.Offset - 4);
-            if (count is < 3 or > 7) continue;
+            if (count is < 3 or > 7 || ReadUInt32(source, first.Offset + 8) != 2) continue;
             List<GalaxyCandidate> table = [];
             for (int index = 0; index < count; index++)
             {
@@ -948,6 +918,202 @@ public sealed class AdvToObjConverter
             if (best is null || table.Count > best.Count) best = table;
         }
         return best;
+    }
+
+    private static List<GalaxyCandidate>? FindGuidGalaxyTable(
+        byte[] source, List<GalaxyCandidate> candidates)
+    {
+        int search = Math.Max(0, source.Length - 4_000_000);
+        while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
+        {
+            int header = search;
+            search++;
+            if (header > source.Length - 32) continue;
+            uint count = ReadUInt32(source, header + 28);
+            if (count is < 3 or > 7) continue;
+            int firstOffset = header + 32;
+            List<GalaxyCandidate> table = candidates
+                .Where(candidate => candidate.Offset >= firstOffset
+                    && candidate.Offset <= firstOffset + 500_000
+                    && candidate.Code < count
+                    && ReadUInt32(source, candidate.Offset + 8) is 1 or 2)
+                .Take((int)count)
+                .ToList();
+            if (table.Count == count
+                && table[0].Offset == firstOffset
+                && table.Select(item => item.Code).Distinct().Count() == count
+                && table.Select(item => item.Ordinal).Distinct().Count() == count)
+            {
+                return table;
+            }
+        }
+        return null;
+    }
+
+    private static List<GalaxyCandidate>? FindShiftedVariant2GalaxyTable(byte[] source)
+    {
+        int search = Math.Max(0, source.Length - 4_000_000);
+        while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
+        {
+            int header = search;
+            search++;
+            if (header > source.Length - 32) continue;
+            uint count = ReadUInt32(source, header + 28);
+            if (count is < 3 or > 7 || header + 32L + count * 80 > source.Length) continue;
+            List<GalaxyCandidate> table = [];
+            for (int index = 0; index < count; index++)
+            {
+                int expectedOffset = header + 32 + index * 80;
+                GalaxyCandidate? record = null;
+                foreach (int shift in new[] { 0, -2, 2, -1, 1 })
+                {
+                    int offset = expectedOffset + shift;
+                    if (offset < header + 32 || offset > source.Length - 64) continue;
+                    uint code = ReadUInt32(source, offset);
+                    uint ordinal = ReadUInt32(source, offset + 4);
+                    if (code >= count || ordinal > 6
+                        || ReadUInt32(source, offset + 8) != 2
+                        || ReadUInt32(source, offset + 12) != 1)
+                    {
+                        continue;
+                    }
+
+                    bool repaired = shift != 0;
+                    double[] position = new double[3];
+                    for (int axis = 0; axis < 3; axis++)
+                    {
+                        int coordinateOffset = offset + 40 + axis * 8;
+                        double value = ReadDouble(source, coordinateOffset);
+                        if (!IsSymbolCoordinate(value))
+                        {
+                            value = BitConverter.Int64BitsToDouble(
+                                unchecked((long)(ReadUInt64(source, coordinateOffset) << 16)));
+                            repaired = true;
+                        }
+                        position[axis] = value;
+                    }
+                    Vertex vertex = new(position[0], position[1], position[2]);
+                    if (!IsGalaxyPosition(vertex)) continue;
+                    record = new GalaxyCandidate(offset, (int)code, (int)ordinal, vertex, repaired);
+                    break;
+                }
+                if (record is null)
+                {
+                    table.Clear();
+                    break;
+                }
+                table.Add(record);
+            }
+            if (table.Count == count
+                && table.Select(item => item.Code).Distinct().Count() == count
+                && table.Select(item => item.Ordinal).Distinct().Count() == count
+                && table.Any(item => item.Repaired))
+            {
+                return table;
+            }
+        }
+        return null;
+    }
+
+    private static List<GalaxyCandidate>? FindGalaxyTableWithInactiveSlot(
+        byte[] source, List<GalaxyCandidate> candidates)
+    {
+        int search = Math.Max(0, source.Length - 4_000_000);
+        while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
+        {
+            int header = search;
+            search++;
+            if (header > source.Length - 32) continue;
+            uint count = ReadUInt32(source, header + 28);
+            if (count is < 4 or > 7) continue;
+            int first = header + 32;
+            int inactiveCode = -1;
+            int inactiveOffset = -1;
+            for (int offset = first; offset <= Math.Min(source.Length - 80, first + 500_000); offset++)
+            {
+                uint code = ReadUInt32(source, offset);
+                if (code >= count || ReadUInt32(source, offset + 8) != 2
+                    || ReadUInt32(source, offset + 12) != 3
+                    || !source.AsSpan(offset + 16, 48).SequenceEqual(new byte[48])) continue;
+                inactiveCode = (int)code;
+                inactiveOffset = offset;
+                break;
+            }
+            if (inactiveCode < 0 || inactiveOffset != first && inactiveOffset > first + count * 80)
+                continue;
+
+            List<GalaxyCandidate> table = [];
+            for (int code = 0; code < count; code++)
+            {
+                if (code == inactiveCode) continue;
+                GalaxyCandidate? entry = candidates.FirstOrDefault(candidate =>
+                    candidate.Code == code && candidate.Offset >= first
+                    && candidate.Offset <= first + 500_000
+                    && ReadUInt32(source, candidate.Offset + 8) is 1 or 2);
+                if (entry is null && inactiveOffset > first)
+                {
+                    // Variant-2 records occupy fixed 80-byte slots. Their
+                    // last coordinate may have lost its low two bytes.
+                    int offset = first + code * 80;
+                    if (offset <= source.Length - 64
+                        && ReadUInt32(source, offset) == code
+                        && ReadUInt32(source, offset + 8) == 2
+                        && ReadUInt32(source, offset + 12) == 1)
+                    {
+                        double[] values = new double[3];
+                        bool repaired = false;
+                        for (int axis = 0; axis < 3; axis++)
+                        {
+                            int coordinate = offset + 40 + axis * 8;
+                            double value = ReadDouble(source, coordinate);
+                            if (!IsSymbolCoordinate(value))
+                            {
+                                value = BitConverter.Int64BitsToDouble(
+                                    unchecked((long)(ReadUInt64(source, coordinate) << 16)));
+                                repaired = true;
+                            }
+                            values[axis] = value;
+                        }
+                        Vertex position = new(values[0], values[1], values[2]);
+                        if (IsGalaxyPosition(position))
+                            entry = new GalaxyCandidate(offset, code, (int)ReadUInt32(source, offset + 4),
+                                position, repaired);
+                    }
+                }
+                if (entry is null)
+                {
+                    table.Clear();
+                    break;
+                }
+                table.Add(entry);
+            }
+            if (table.Count == count - 1
+                && table.Select(item => item.Code).Distinct().Count() == count - 1
+                && table.Select(item => item.Ordinal).Distinct().Count() == count - 1)
+                return table;
+        }
+        return null;
+    }
+
+    private static bool HasInactiveGalaxySlot(byte[] source)
+    {
+        int search = Math.Max(0, source.Length - 4_000_000);
+        while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
+        {
+            int header = search;
+            search++;
+            if (header > source.Length - 32 || ReadUInt32(source, header + 28) != 6) continue;
+            int first = header + 32;
+            for (int index = 0; index < 6 && first + index * 80 <= source.Length - 64; index++)
+            {
+                int offset = first + index * 80;
+                if (ReadUInt32(source, offset + 8) == 2
+                    && ReadUInt32(source, offset + 12) == 3
+                    && source.AsSpan(offset + 16, 48).SequenceEqual(new byte[48]))
+                    return true;
+            }
+        }
+        return false;
     }
 
     private static List<GalaxyCandidate>? SelectGalaxySequence(
@@ -996,6 +1162,10 @@ public sealed class AdvToObjConverter
         }
         return new[] { position.X, position.Y, position.Z }.Count(value => Math.Abs(value) > 1) >= 2;
     }
+
+    private static bool IsSymbolCoordinate(double value) =>
+        double.IsFinite(value) && Math.Abs(value) < 10_000
+        && (value == 0 || Math.Abs(value) > 1e-20);
 
     private static Mesh DecodeMesh(byte[] payload)
     {
@@ -1757,9 +1927,10 @@ public sealed class AdvToObjConverter
         double Distance,
         Vertex Normal);
 
-    private sealed record GalaxyCandidate(int Offset, int Code, int Ordinal, Vertex Position);
+    private sealed record GalaxyCandidate(int Offset, int Code, int Ordinal, Vertex Position,
+        bool Repaired = false);
 
-    private sealed record GalaxySymbol(string Label, Vertex Position);
+    private sealed record GalaxySymbol(string Label, Vertex Position, bool Repaired = false);
 
     private sealed record HullFace(int A, int B, int C, Vertex Normal, double Offset);
 

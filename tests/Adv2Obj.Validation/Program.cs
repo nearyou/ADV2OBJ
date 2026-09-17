@@ -105,12 +105,15 @@ Directory.CreateDirectory(temporary);
 
 var converter = new AdvToObjConverter();
 int passed = 0;
+int failed = 0;
 try
 {
     foreach (string adv in Directory.EnumerateFiles(input, "*.adv").Order()
                  .Where(path => args.Length < 2 || Path.GetFileNameWithoutExtension(path) == args[1]))
     {
         string name = Path.GetFileNameWithoutExtension(adv);
+        try
+        {
         string referenceDirectory = Path.Combine(referenceRoot, name);
         string reference = Path.Combine(referenceDirectory, name + "_Rough.obj");
             string preexistingDirectory = Path.Combine(temporary, name);
@@ -180,7 +183,7 @@ try
                 if (!File.Exists(actualFile)
                     || !File.ReadAllBytes(actualFile).SequenceEqual(File.ReadAllBytes(expectedFile)))
                 {
-                    throw new Exception($"{Path.GetFileName(expectedFile)} is not byte-identical to the certified export.");
+                    throw new Exception($"{Path.GetFileName(expectedFile)} differs from the Advisor reference export.");
                 }
             }
             foreach (string plannedObject in actualObjects.Where(file => !file.Contains("_Rough.")))
@@ -198,6 +201,12 @@ try
                               + $"{result.RepairedVertexCount:N0} repaired, "
                               + $"max/RMS error {maximumError:G6}/{rmsError:G6}");
             passed++;
+        }
+        catch (Exception error)
+        {
+            failed++;
+            Console.WriteLine($"FAIL {name}: {error.GetType().Name}: {error.Message}");
+        }
     }
 }
 finally
@@ -205,10 +214,8 @@ finally
     if (string.IsNullOrWhiteSpace(retainedOutput)) Directory.Delete(temporary, true);
 }
 
-if (args.Length < 2 && passed != 6)
-{
-    throw new Exception($"Validation incomplete: {passed} passed.");
-}
+Console.WriteLine($"Reference comparison: {passed} matched; {failed} differed or failed.");
+Environment.ExitCode = failed == 0 && (args.Length >= 2 || passed == 6) ? 0 : 1;
 
 static ObjData ReadObj(string path)
 {
