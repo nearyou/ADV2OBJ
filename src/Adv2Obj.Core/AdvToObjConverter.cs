@@ -7,7 +7,7 @@ using gs;
 
 namespace Adv2Obj.Core;
 
-public sealed class AdvToObjConverter
+public sealed partial class AdvToObjConverter
 {
     private static readonly byte[] AdvSignature =
         [0xCA, 0x9B, 0x28, 0xC7, 0xD7, 0xEC, 0x9B, 0x45, 0xAA, 0xBF, 0xE4, 0x42, 0x3F, 0xEF, 0x0E, 0xFF];
@@ -95,13 +95,14 @@ public sealed class AdvToObjConverter
         }
         catch (AdvFormatException)
         {
-            Mesh? completeAlternate = CountFaceRecords(payload) < 100
+            Mesh? radialRecovery = TryRecoverPointSurface(payload, cancellationToken);
+            Mesh? completeAlternate = radialRecovery ?? (CountFaceRecords(payload) < 100
                 ? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
-                : null;
+                : null);
             if (completeAlternate is not null)
             {
                 mesh = completeAlternate;
-                mesh.Warnings.Add(
+                if (radialRecovery is null) mesh.Warnings.Add(
                     "Primary rough mesh is damaged; recovered a closed alternate mesh from the ADV. Verify its shape in MeshLab.");
             }
             else
@@ -126,6 +127,9 @@ public sealed class AdvToObjConverter
                 "Primary uncompressed rough mesh is damaged; recovered a later closed mesh from the ADV. Verify its shape in MeshLab.");
         }
         List<CutPlane> cuts = DecodeActiveCutPlanes(source, roughRecordEnd);
+        List<CutGroup> groups = DecodeCutGroups(source, cuts);
+        if (groups.Count > 0)
+            cuts = groups.SelectMany(group => group.Cuts).Select(item => item.Plane).ToList();
         if (cuts.Count == 0)
         {
             mesh.Warnings.Add("No Pie/Saw cutting plan is present; exported the rough mesh only.");
@@ -159,7 +163,7 @@ public sealed class AdvToObjConverter
         foreach (CutPlane cut in cuts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Mesh slice = SliceMesh(cuttingMesh, cut, cuts);
+            Mesh slice = SliceMesh(cuttingMesh, cut, cuts, groups);
             await WriteObjAtomicallyAsync(
                 Path.Combine(stagingDirectory, $"{stem}_{cut.Name}.obj"),
                 slice,
@@ -194,7 +198,7 @@ public sealed class AdvToObjConverter
         }
         finally
         {
-            if (Directory.Exists(stagingDirectory)) Directory.Delete(stagingDirectory, true);
+            if (Directory.Exists(stagingDirectory)) RetryFileOperation(() => Directory.Delete(stagingDirectory, true));
         }
     }
 
@@ -213,7 +217,7 @@ public sealed class AdvToObjConverter
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
         if (!Directory.Exists(destination))
         {
-            Directory.Move(staging, destination);
+            RetryFileOperation(() => Directory.Move(staging, destination));
             return;
         }
 
@@ -231,13 +235,13 @@ public sealed class AdvToObjConverter
                 string name = Path.GetFileName(path);
                 if (!System.Text.RegularExpressions.Regex.IsMatch(name, pattern,
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase)) continue;
-                File.Move(path, Path.Combine(backup, name));
+                RetryFileOperation(() => File.Move(path, Path.Combine(backup, name)));
                 previous.Add(name);
             }
             foreach (string path in Directory.EnumerateFiles(staging))
             {
                 string name = Path.GetFileName(path);
-                File.Move(path, Path.Combine(destination, name));
+                RetryFileOperation(() => File.Move(path, Path.Combine(destination, name)));
                 published.Add(name);
             }
             mayRemoveBackup = true;
@@ -259,7 +263,17 @@ public sealed class AdvToObjConverter
         }
         finally
         {
-            if (mayRemoveBackup) Directory.Delete(backup, true);
+            if (mayRemoveBackup) RetryFileOperation(() => Directory.Delete(backup, true));
+        }
+    }
+
+    private static void RetryFileOperation(Action operation)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try { operation(); return; }
+            catch (IOException error) when (attempt < 5 && (error.HResult & 0xffff) is 5 or 32 or 33)
+            { Thread.Sleep(50 * (attempt + 1)); }
         }
     }
 
@@ -529,8 +543,10 @@ public sealed class AdvToObjConverter
                     continue;
                 }
 
-                decoded = new CutPlane(name, planNumber, width, distance,
-                    Multiply(normal, 1 / magnitude));
+                // Keep the plane equation exactly as stored. Normalizing only
+                // the normal, without scaling its distance and kerf bounds,
+                // moves the cut. Clipping does not require a unit normal.
+                decoded = new CutPlane(name, planNumber, width, distance, normal);
                 break;
             }
             if (decoded is not null)
@@ -554,6 +570,7 @@ public sealed class AdvToObjConverter
             .Where(candidate => candidate.Plane.PlanNumber == activePlan)
             .TakeWhile(candidate => candidate.Offset - candidates[0].Offset < 100_000)
             .Select(candidate => candidate.Plane)
+            .DistinctBy(plane => plane.Name)
             .ToList();
         if (result.Count == 0)
         {
@@ -576,7 +593,7 @@ public sealed class AdvToObjConverter
         return false;
     }
 
-    private static Mesh SliceMesh(Mesh source, CutPlane cut, List<CutPlane> cuts)
+    private static Mesh SliceMesh(Mesh source, CutPlane cut, List<CutPlane> cuts, List<CutGroup> groups)
     {
         Mesh upper = ClipClosedMesh(source, cut.Normal, cut.Distance, keepLessOrEqual: true);
         Mesh slab = ClipClosedMesh(
@@ -593,9 +610,17 @@ public sealed class AdvToObjConverter
             int dash = cut.Name.LastIndexOf('-');
             if (dash >= 0 && int.TryParse(cut.Name.AsSpan(dash + 1), out int ordinal))
             {
-                int companionOrdinal = (ordinal & 1) == 0 ? ordinal - 1 : ordinal + 1;
-                string companionName = cut.Name[..(dash + 1)] + companionOrdinal;
-                CutPlane? companion = cuts.FirstOrDefault(candidate => candidate.Name == companionName);
+                string prefix = cut.Name[..(dash + 1)];
+                // Plans can number Pie records from either zero or one.
+                // Determine the origin from this plan's records, so the first
+                // zero-based cut is paired with 1 rather than the nonexistent -1.
+                int firstOrdinal = cuts.Any(candidate => candidate.Name == prefix + "0") ? 0 : 1;
+                int companionOrdinal = ((ordinal - firstOrdinal) & 1) == 0 ? ordinal + 1 : ordinal - 1;
+                string companionName = prefix + companionOrdinal;
+                CutGroup? group = groups.FirstOrDefault(candidate => candidate.Cuts.Any(item => item.Plane.Name == cut.Name));
+                CutPlane? companion = group is not null
+                    ? group.Cuts.Single(item => item.Plane.Name != cut.Name).Plane
+                    : cuts.FirstOrDefault(candidate => candidate.Name == companionName);
                 if (companion is not null)
                 {
                     Mesh paired = ClipClosedMesh(slab, companion.Normal,
@@ -611,6 +636,7 @@ public sealed class AdvToObjConverter
                 }
             }
         }
+        slab = ApplyCutHistory(slab, cut, groups);
         if (slab.Vertices.Count < 4 || slab.Faces.Count < 4)
         {
             double minimum = source.Vertices.Min(vertex => Dot(cut.Normal, vertex));
@@ -622,12 +648,25 @@ public sealed class AdvToObjConverter
         int invalidEdges = CountInvalidEdges(slab.Faces);
         if (invalidEdges > 0)
         {
+            var separated = TriangleTopology.SeparateTouchingFans(slab.Vertices.Count, slab.Faces);
+            if (separated.VertexSources.Count > slab.Vertices.Count
+                && CountInvalidEdges(separated.Faces) == 0)
+            {
+                int duplicated = separated.VertexSources.Count - slab.Vertices.Count;
+                slab = new Mesh(separated.VertexSources.Select(index => slab.Vertices[index]).ToList(),
+                    separated.Faces, slab.RepairedVertexCount, slab.Warnings);
+                source.Warnings.Add($"{cut.Name}: separated {duplicated} shared vertices at touching surfaces; triangle coordinates are unchanged.");
+                invalidEdges = 0;
+            }
+        }
+        if (invalidEdges > 0)
+        {
             source.Warnings.Add($"{cut.Name}: {invalidEdges} non-manifold cut edges remain near repaired coordinates; review this mesh in MeshLab.");
         }
         return slab;
     }
 
-    private static Mesh BuildConvexHull(Mesh source)
+    private static Mesh BuildConvexHull(Mesh source, CancellationToken cancellationToken = default)
     {
         List<Vertex> points = source.Vertices;
         if (points.Count < 4) throw new AdvFormatException("The rough mesh has too few vertices.");
@@ -653,6 +692,7 @@ public sealed class AdvToObjConverter
         HashSet<int> seed = [a, b, c, d];
         for (int pointIndex = 0; pointIndex < points.Count; pointIndex++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (seed.Contains(pointIndex)) continue;
             List<HullFace> visible = faces
                 .Where(face => Dot(face.Normal, points[pointIndex]) - face.Offset > epsilon)
@@ -714,7 +754,7 @@ public sealed class AdvToObjConverter
 
     private static Mesh ClipClosedMesh(Mesh source, Vertex normal, double offset, bool keepLessOrEqual)
     {
-        var builder = new MeshBuilder();
+        var builder = new MeshBuilder(source.RepairedVertexCount > 0);
         foreach ((int a, int b, int c) in source.Faces)
         {
             List<Vertex> polygon = [source.Vertices[a], source.Vertices[b], source.Vertices[c]];
@@ -729,6 +769,7 @@ public sealed class AdvToObjConverter
         }
 
         builder.CapOpenBoundaries();
+        ReportApproximateCaps(source, builder);
         return new Mesh(builder.Vertices, builder.Faces, source.RepairedVertexCount, source.Warnings);
     }
 
@@ -783,14 +824,14 @@ public sealed class AdvToObjConverter
         CancellationToken token)
     {
         StringBuilder contents = new();
-        contents.AppendLine("[saws]");
-        contents.AppendLine(cuts.Count.ToString(CultureInfo.InvariantCulture));
+        contents.Append("[saws]\n");
+        contents.Append(cuts.Count.ToString(CultureInfo.InvariantCulture)).Append('\n');
         foreach (CutPlane cut in cuts)
         {
             token.ThrowIfCancellationRequested();
-            contents.AppendLine(string.Create(
+            contents.Append(string.Create(
                 CultureInfo.InvariantCulture,
-                $"{cut.Name} Width:{cut.Width:G17}"));
+                $"{cut.Name} Width:{cut.Width:G17}")).Append('\n');
         }
         await WriteTextAtomicallyAsync(path, contents.ToString(), token);
     }
@@ -853,15 +894,16 @@ public sealed class AdvToObjConverter
             candidates.Add(new GalaxyCandidate(offset, (int)code, (int)ordinal, position));
         }
 
-        List<GalaxyCandidate>? required = SelectGalaxySequence(candidates, 6);
+        // Prefer an explicitly bounded table to a guessed six-symbol sequence.
+        // An ADV can also contain older plans or inactive symbol records.
+        List<GalaxyCandidate>? required = FindGuidGalaxyTable(source, candidates)
+            ?? FindCountedGalaxyTable(source, candidates)
+            ?? FindShiftedVariant2GalaxyTable(source)
+            ?? FindGalaxyTableWithInactiveSlot(source, candidates);
+        bool hasDeclaredTable = required is not null;
         if (required is null)
         {
-            // A valid Galaxy table can contain fewer than six entries. Its
-            // signature and count identify the complete set when present.
-            required = FindGuidGalaxyTable(source, candidates)
-                ?? FindCountedGalaxyTable(source, candidates)
-                ?? FindShiftedVariant2GalaxyTable(source)
-                ?? FindGalaxyTableWithInactiveSlot(source, candidates);
+            required = SelectGalaxySequence(candidates, 6);
             if (required is null)
             {
                 throw new AdvFormatException("The Galaxy symbol coordinate table was not found.");
@@ -878,7 +920,7 @@ public sealed class AdvToObjConverter
                 && candidate.Offset <= maximumOffset + 500_000)
             .OrderBy(candidate => Math.Abs(candidate.Offset - maximumOffset))
             .FirstOrDefault();
-        if (optional is not null) required.Add(optional);
+        if (!hasDeclaredTable && optional is not null) required.Add(optional);
 
         return required
             .OrderBy(candidate => candidate.Ordinal)
@@ -1574,6 +1616,25 @@ public sealed class AdvToObjConverter
 
     private static int FindBestVertexStart(byte[] payload, int estimate, int faceStart, int vertexCount)
     {
+        // The serialized mesh record starts with its byte length and vertex
+        // count. Its declared length includes both counts, all vertex triples,
+        // and all triangle records, even when bytes inside the record are lost.
+        // Use that structural boundary before considering plausible doubles:
+        // preceding metadata can itself decode to perfectly finite coordinates.
+        long declaredLength = 8L + vertexCount * 24L + (payload.Length - faceStart - 4);
+        int structuralStart = -1;
+        for (int candidate = Math.Max(8, estimate);
+             candidate <= Math.Min(faceStart - 24, estimate + 128); candidate++)
+        {
+            if (ReadUInt32(payload, candidate - 8) != declaredLength) continue;
+            if (structuralStart >= 0)
+            {
+                throw new AdvFormatException("The rough mesh contains ambiguous vertex-record boundaries.");
+            }
+            structuralStart = candidate;
+        }
+        if (structuralStart >= 0) return structuralStart;
+
         int sampleCount = Math.Min(100, vertexCount);
         int sampleOffset = Math.Min(32, Math.Max(0, vertexCount - sampleCount));
         int minimum = Math.Max(0, estimate);
@@ -1934,13 +1995,20 @@ public sealed class AdvToObjConverter
 
     private sealed record HullFace(int A, int B, int C, Vertex Normal, double Offset);
 
-    private sealed class MeshBuilder
+    private static void ReportApproximateCaps(Mesh source, MeshBuilder builder)
+    {
+        const string warning = "Some boundaries of the repaired surface could not be triangulated reliably; approximate caps were used and require review.";
+        if (builder.ApproximateCapCount > 0 && !source.Warnings.Contains(warning)) source.Warnings.Add(warning);
+    }
+
+    private sealed class MeshBuilder(bool allowApproximateCaps = false)
     {
         private const double Quantization = 1_000_000.0;
         private readonly Dictionary<(long X, long Y, long Z), int> _vertexLookup = [];
 
         public List<Vertex> Vertices { get; } = [];
         public List<(int A, int B, int C)> Faces { get; } = [];
+        public int ApproximateCapCount { get; private set; }
 
         public int AddVertex(Vertex vertex)
         {
@@ -1960,7 +2028,8 @@ public sealed class AdvToObjConverter
             if (a != b && b != c && c != a) Faces.Add((a, b, c));
         }
 
-        public void CapOpenBoundaries()
+        public void CapOpenBoundaries((Vertex Normal, double Offset)? firstPlane = null,
+            (Vertex Normal, double Offset)? secondPlane = null)
         {
             Dictionary<ulong, (int Count, int A, int B)> edges = [];
             foreach ((int a, int b, int c) in Faces)
@@ -2016,18 +2085,56 @@ public sealed class AdvToObjConverter
                 }
                 if (current != start || loop.Count < 3) continue;
 
-                Vertex center = new(
-                    loop.Average(index => Vertices[index].X),
-                    loop.Average(index => Vertices[index].Y),
-                    loop.Average(index => Vertices[index].Z));
-                int centerIndex = AddVertex(center);
-                for (int index = 0; index < loop.Count; index++)
+                if (firstPlane is { } planeA && secondPlane is { } planeB)
                 {
-                    int a = loop[index];
-                    int b = loop[(index + 1) % loop.Count];
-                    AddFace(b, a, centerIndex);
+                    int PlaneOfEdge(int index)
+                    {
+                        Vertex a = Vertices[loop[index]], b = Vertices[loop[(index + 1) % loop.Count]];
+                        return Math.Max(Math.Abs(Dot(a, planeA.Normal) - planeA.Offset),
+                            Math.Abs(Dot(b, planeA.Normal) - planeA.Offset)) < 1e-5 ? 0 : 1;
+                    }
+                    int transition = Enumerable.Range(0, loop.Count)
+                        .FirstOrDefault(i => PlaneOfEdge(i) != PlaneOfEdge((i + loop.Count - 1) % loop.Count), -1);
+                    if (transition >= 0)
+                    {
+                        List<int> chain = [loop[transition]];
+                        for (int step = 0; step < loop.Count; step++)
+                        {
+                            int index = (transition + step) % loop.Count;
+                            int nextIndex = (index + 1) % loop.Count;
+                            chain.Add(loop[nextIndex]);
+                            if (PlaneOfEdge(index) != PlaneOfEdge(nextIndex))
+                            {
+                                TriangulateBoundary(chain);
+                                chain = [loop[nextIndex]];
+                            }
+                        }
+                        continue;
+                    }
                 }
+                TriangulateBoundary(loop);
             }
+        }
+
+        private void TriangulateBoundary(List<int> boundary)
+        {
+            // Ear clipping preserves concave outlines. A fan about the average
+            // point can extend outside the cut and overlap other triangles.
+            var triangles = TriangulatePlanarBoundary(boundary, Vertices, out bool complete);
+            if (!complete && allowApproximateCaps)
+            {
+                // Preserve the older recovery behavior only for an already
+                // reconstructed surface, and explicitly report its uncertainty.
+                int center = Vertices.Count;
+                Vertices.Add(new Vertex(boundary.Average(i => Vertices[i].X),
+                    boundary.Average(i => Vertices[i].Y), boundary.Average(i => Vertices[i].Z)));
+                for (int i = 0; i < boundary.Count; i++)
+                    AddFace(boundary[(i + 1) % boundary.Count], boundary[i], center);
+                ApproximateCapCount++;
+                return;
+            }
+            foreach (var (a, b, c) in triangles)
+                AddFace(a, b, c);
         }
 
         private static void CountEdge(

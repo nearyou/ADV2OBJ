@@ -88,6 +88,8 @@ public partial class MainWindow : Window
         RefreshFileList();
         if (Files.Count == 0) return;
 
+        bool deleteAfterConversion = DeleteAfterConversionCheckBox.IsChecked == true;
+        DeleteAfterConversionCheckBox.IsEnabled = false;
         ConvertButton.IsEnabled = false;
         CancelButton.IsEnabled = true;
         InputControls.IsEnabled = false;
@@ -109,10 +111,13 @@ public partial class MainWindow : Window
                 {
                     string inputPath = item.InputPath;
                     ConversionAndCleanupResult outcome = await Task.Run(
-                        () => _converter.ConvertAndRemoveInputAsync(inputPath, outputFolder, cancellationToken),
+                        async () => deleteAfterConversion
+                            ? await _converter.ConvertAndRemoveInputAsync(inputPath, outputFolder, cancellationToken)
+                            : new ConversionAndCleanupResult(
+                                await _converter.ConvertAsync(inputPath, outputFolder, cancellationToken), false, null),
                         cancellationToken);
                     succeeded++;
-                    item.Status = outcome.InputRemoved ? "Completed" : "Input retained";
+                    item.Status = !deleteAfterConversion || outcome.InputRemoved ? "Completed" : "Input retained";
                     ConversionResult result = outcome.Conversion;
                     item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
                     if (result.RepairedVertexCount > 0)
@@ -126,6 +131,10 @@ public partial class MainWindow : Window
                     if (outcome.InputRemoved)
                     {
                         item.Details += "; input ADV removed";
+                    }
+                    else if (!deleteAfterConversion)
+                    {
+                        item.Details += "; input ADV kept";
                     }
                     else
                     {
@@ -157,6 +166,7 @@ public partial class MainWindow : Window
             CancelButton.IsEnabled = false;
             InputControls.IsEnabled = true;
             OutputControls.IsEnabled = true;
+            DeleteAfterConversionCheckBox.IsEnabled = true;
         }
     }
 

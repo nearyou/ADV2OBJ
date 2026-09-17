@@ -1,5 +1,41 @@
 using Adv2Obj.Core;
 
+if (args is ["--surface-check", string surfaceRoot])
+{
+    int checkedMeshes = 0;
+    int failedMeshes = 0;
+    foreach (string file in Directory.EnumerateFiles(surfaceRoot, "*.obj", SearchOption.AllDirectories))
+    {
+        if (Path.GetRelativePath(surfaceRoot, file).Split(Path.DirectorySeparatorChar)
+            .Any(part => part.StartsWith(".adv2obj-", StringComparison.Ordinal))) continue;
+        ObjData mesh = ReadObj(file);
+        var faces = mesh.Faces.Select(face => (face.A - 1, face.B - 1, face.C - 1)).ToList();
+        var separated = TriangleTopology.SeparateTouchingFans(mesh.Vertices.Count, faces);
+        checkedMeshes++;
+        try
+        {
+            DecoderChecks.VerifySeparation(faces, separated.VertexSources, separated.Faces);
+        }
+        catch (Exception error)
+        {
+            failedMeshes++;
+            Console.WriteLine($"FAIL {Path.GetFileName(file)}: {error.Message}");
+            continue;
+        }
+        if (separated.VertexSources.Count != mesh.Vertices.Count)
+            Console.WriteLine($"PASS {Path.GetFileName(file)}: shared vertices separated with identical triangle geometry.");
+    }
+    Console.WriteLine($"Surface checks: {checkedMeshes - failedMeshes} passed; {failedMeshes} require review.");
+    Environment.ExitCode = failedMeshes == 0 ? 0 : 1;
+    return;
+}
+
+if (args is ["--decoder-check"])
+{
+    await DecoderChecks.RunAsync();
+    return;
+}
+
 if (args is ["--cleanup-check", string cleanupRoot])
 {
     string cleanupTemporary = Directory.CreateTempSubdirectory("adv2obj-cleanup-").FullName;
