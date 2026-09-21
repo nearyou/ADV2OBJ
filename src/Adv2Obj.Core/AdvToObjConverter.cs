@@ -59,10 +59,14 @@ public sealed partial class AdvToObjConverter
         }
     }
 
-    public async Task<ConversionResult> ConvertAsync(
+    public Task<ConversionResult> ConvertAsync(
         string inputPath,
         string outputRoot,
         CancellationToken cancellationToken = default)
+        => ConvertCoreAsync(inputPath, outputRoot, cancellationToken, allowScanRefinement: true);
+
+    private async Task<ConversionResult> ConvertCoreAsync(string inputPath, string outputRoot,
+        CancellationToken cancellationToken, bool allowScanRefinement)
     {
         byte[] source = await File.ReadAllBytesAsync(inputPath, cancellationToken);
         ValidateAdv(source);
@@ -96,7 +100,8 @@ public sealed partial class AdvToObjConverter
         }
         catch (AdvFormatException)
         {
-            Mesh? radialRecovery = TryRecoverPointSurface(payload, cancellationToken);
+            Mesh? radialRecovery = TryRecoverDeclaredMesh(payload, cancellationToken)
+                ?? TryRecoverPointSurface(payload, cancellationToken);
             Mesh? completeAlternate = radialRecovery ?? (CountFaceRecords(payload) < 100
                 ? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
                 : null);
@@ -115,8 +120,9 @@ public sealed partial class AdvToObjConverter
                 catch (AdvFormatException primaryError)
                 {
                     mesh = TryRecoverSegmentedMesh(payload, cancellationToken)
+                        ?? TryRecoverDeclaredMesh(payload, cancellationToken, allowShifted: true)
                         ?? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
-                        ?? TryRecoverPolygonMesh(payload, cancellationToken)
+                        ?? RecoverPolygonMesh(payload, cancellationToken, allowScanRefinement)
                         ?? throw new AdvFormatException(
                             $"{primaryError.Message} No complete alternate mesh was found.");
                     mesh.Warnings.Add(
@@ -130,6 +136,8 @@ public sealed partial class AdvToObjConverter
                 "Primary uncompressed rough mesh is damaged; recovered a later closed mesh from the ADV. Verify its shape in MeshLab.");
         }
         List<CutPlane> cuts = DecodeActiveCutPlanes(source, roughRecordEnd);
+        if (cuts.Any(cut => cut.UsesStoredPlanFallback))
+            mesh.Warnings.Add($"No cached active cut plan was found; exported the first readable stored plan ({cuts[0].PlanNumber}). Verify plan selection in Advisor.");
         List<CutGroup> groups = DecodeCutGroups(source, cuts);
         if (groups.Count > 0)
             cuts = groups.SelectMany(group => group.Cuts).Select(item => item.Plane).ToList();
@@ -168,8 +176,14 @@ public sealed partial class AdvToObjConverter
         {
             cancellationToken.ThrowIfCancellationRequested();
             Mesh? slice = SliceMesh(cuttingMesh, cut, cuts, groups);
-            if (slice is null) continue;
+            if (slice is null)
+            {
+                if (mesh.UsesRecoveredScanSurface)
+                    throw new AdvFormatException("A cut could not be recovered on the refined scan surface.");
+                continue;
+            }
             if (mesh.UsesCoarseSurface) slice = slice with { UsesCoarseSurface = true };
+            if (mesh.UsesRecoveredScanSurface) slice = slice with { UsesRecoveredScanSurface = true };
             await WriteObjAtomicallyAsync(
                 Path.Combine(stagingDirectory, $"{stem}_{cut.Name}.obj"),
                 slice,
@@ -201,7 +215,14 @@ public sealed partial class AdvToObjConverter
             mesh.Vertices.Count,
             mesh.Faces.Count,
             mesh.RepairedVertexCount,
-            warnings) { UsesCoarseSurface = mesh.UsesCoarseSurface };
+            warnings) { UsesCoarseSurface = mesh.UsesCoarseSurface, UsesRecoveredScanSurface = mesh.UsesRecoveredScanSurface };
+        }
+        catch (AdvFormatException) when (mesh.UsesRecoveredScanSurface && allowScanRefinement)
+        {
+            ConversionResult fallback = await ConvertCoreAsync(inputPath, outputRoot,
+                cancellationToken, allowScanRefinement: false);
+            return fallback with { Warnings = [.. fallback.Warnings,
+                "Scan refinement did not produce a complete cutting plan; retained the polygon-surface conversion."] };
         }
         finally
         {
@@ -317,6 +338,7 @@ public sealed partial class AdvToObjConverter
             {
                 return FindRawMeshPayload(source, metadataOffset)
                     ?? FindSegmentedRawPayload(source, metadataOffset)
+                    ?? FindDeclaredRawPayload(source, metadataOffset)
                     ?? throw new AdvFormatException(
                         "No complete embedded ZIP or uncompressed rough mesh was found.");
             }
@@ -509,10 +531,10 @@ public sealed partial class AdvToObjConverter
         return compressedData.Length - 1;
     }
 
-    private static List<CutPlane> DecodeActiveCutPlanes(byte[] source, int searchStart)
+    private static List<CutPlane> DecodeActiveCutPlanes(byte[] source, int searchStart, bool extendedSearch = false)
     {
         List<(int Offset, CutPlane Plane)> candidates = [];
-        int searchEnd = Math.Min(source.Length, searchStart + 5_000_000);
+        int searchEnd = extendedSearch ? source.Length : Math.Min(source.Length, searchStart + 5_000_000);
         for (int offset = Math.Max(0, searchStart - 250_000); offset < searchEnd - 8; offset++)
         {
             bool isPie = source[offset] == (byte)'P'
@@ -522,6 +544,8 @@ public sealed partial class AdvToObjConverter
                 && source[offset + 1] == (byte)'a'
                 && source[offset + 2] == (byte)'w';
             if (!isPie && !isSaw) continue;
+            if (extendedSearch && (offset < 84
+                || !source.AsSpan(offset - 84, 16).SequenceEqual(CutRecordSignature))) continue;
 
             int end = offset + 3;
             while (end < searchEnd && source[end] is >= (byte)'0' and <= (byte)'9') end++;
@@ -544,9 +568,9 @@ public sealed partial class AdvToObjConverter
                     ReadDouble(source, offset - 24),
                     ReadDouble(source, offset - 16));
                 double magnitude = Math.Sqrt(Dot(normal, normal));
-                if (width is < 1 or > 500
+                if (!double.IsFinite(width) || width is < 1 or > 500
                     || !double.IsFinite(distance) || Math.Abs(distance) > 10_000_000
-                    || Math.Abs(magnitude - 1) > 0.02)
+                    || !double.IsFinite(magnitude) || Math.Abs(magnitude - 1) > 0.02)
                 {
                     continue;
                 }
@@ -554,7 +578,7 @@ public sealed partial class AdvToObjConverter
                 // Keep the plane equation exactly as stored. Normalizing only
                 // the normal, without scaling its distance and kerf bounds,
                 // moves the cut. Clipping does not require a unit normal.
-                decoded = new CutPlane(name, planNumber, width, distance, normal);
+                decoded = new CutPlane(name, planNumber, width, distance, normal) { UsesStoredPlanFallback = extendedSearch };
                 break;
             }
             if (decoded is not null)
@@ -566,6 +590,9 @@ public sealed partial class AdvToObjConverter
 
         if (candidates.Count == 0)
         {
+            // Large raw ADV containers can store their first cutting collection
+            // tens of megabytes after the rough scan, beyond the cache window.
+            if (!extendedSearch) return DecodeActiveCutPlanes(source, searchStart, extendedSearch: true);
             if (!ContainsNamedCut(source))
             {
                 return [];
@@ -927,7 +954,8 @@ public sealed partial class AdvToObjConverter
         List<GalaxyCandidate>? required = FindGuidGalaxyTable(source, candidates)
             ?? FindCountedGalaxyTable(source, candidates)
             ?? FindShiftedVariant2GalaxyTable(source)
-            ?? FindGalaxyTableWithInactiveSlot(source, candidates);
+            ?? FindGalaxyTableWithInactiveSlot(source, candidates)
+            ?? FindOrdinalGalaxyTable(source, candidates);
         bool hasDeclaredTable = required is not null;
         if (required is null)
         {
@@ -1278,6 +1306,12 @@ public sealed partial class AdvToObjConverter
 
     private static Mesh DecodeMesh(byte[] payload)
     {
+        // Not every closed scan has spherical topology. Honor an intact typed
+        // record's counts instead of inventing extra vertices from F = 2V - 4.
+        if (DeclaredScans(payload).Any(r => r.End == payload.Length
+            && r.Table == r.Header + 28 + r.Vertices * 24 && r.Faces != 2 * r.Vertices - 4))
+            return TryRecoverDeclaredMesh(payload, CancellationToken.None)
+                ?? throw new AdvFormatException("The counted scan does not form a consistent closed surface.");
         int faceCount = CountFaceRecords(payload);
         if (faceCount < 4 || (faceCount & 1) != 0)
         {
@@ -2060,6 +2094,8 @@ public sealed partial class AdvToObjConverter
         await writer.WriteLineAsync("# Source format: Sarine Advisor ADV");
         if (mesh.UsesCoarseSurface)
             await writer.WriteLineAsync("# Recovery: stored polygon surface; coarser than the dense scan. Requires visual review.");
+        if (mesh.UsesRecoveredScanSurface)
+            await writer.WriteLineAsync("# Recovery: measured scan points with reconstructed triangle connectivity. Requires visual review.");
         await writer.WriteLineAsync($"g {groupName}");
         foreach (Vertex vertex in mesh.Vertices)
         {
@@ -2127,7 +2163,10 @@ public sealed partial class AdvToObjConverter
         int PlanNumber,
         double Width,
         double Distance,
-        Vertex Normal);
+        Vertex Normal)
+    {
+        public bool UsesStoredPlanFallback { get; init; }
+    }
 
     private sealed record GalaxyCandidate(int Offset, int Code, int Ordinal, Vertex Position,
         bool Repaired = false);
@@ -2326,5 +2365,6 @@ public sealed partial class AdvToObjConverter
         List<string> Warnings)
     {
         public bool UsesCoarseSurface { get; init; }
+        public bool UsesRecoveredScanSurface { get; init; }
     }
 }

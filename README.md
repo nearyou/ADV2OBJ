@@ -180,20 +180,37 @@ planes or a uniquely supported high-byte correction. A repeated cap sign error
 is corrected only when it improves point retention and source-plane agreement.
 
 These are **coarser source surfaces**, not exact dense-scan exports. The UI marks
-them `Review (coarse)` and explains the recovery in Details. Existing successful
+them `Review (coarse)` and explains the recovery in Details. An optional refinement
+now uses the validated polygon surface to guide byte alignment of the dense scan.
+It retains at least 95% of the scan points, checks readable source connectivity,
+requires at least 85% agreement with those readable triangles and a closed surface,
+and limits volume change to 5%. Readable connectivity must cover at least 20% of
+the expected surface to provide an independent check. Reconstructed triangles,
+repaired coordinates and omitted points are reported as `Review (scan)`. If these
+checks fail, or the refined surface cannot produce every recorded cut, conversion
+retains the polygon fallback. Existing successful
 decoders retain priority. No sample names, hashes, or reference-output lookups are
 used. The current seven-file `Downloads/input` batch produces 59 OBJ files plus
 seven CSV/INI pairs, with no conversion failures. All 59 OBJs pass finite-value,
 index and closed-edge validation. The six original samples still produce the
 same 67 output files byte-for-byte as the preceding build.
 
-| Recovered input | OBJ files | Polygon surface vertices |
+| Recovered input | OBJ files | Exported rough vertices |
 | --- | ---: | ---: |
 | `1_9_457.62C-A2.1-726-7-1.adv` | 10 | 614 |
 | `18-8-AU3-396.52-14++57-1.adv` | 7 | 462 |
 | `31_8_457.62C-A2.1-4-8-1.adv` | 8 | 919 |
 | `31_8_457.62C-A2.1-7.adv` | 9 | 754 |
-| `31_8_457.62C-A2.1-8-8-1.adv` | 11 | 608 |
+| `31_8_457.62C-A2.1-8-8-1.adv` | 11 | 10,262 (scan refinement; previously 608) |
+
+The refined input retains 10,262 of 10,271 scan points, with 99 repaired
+coordinates and nine uncertain points omitted. Its reconstructed surface preserves
+5,487 of 6,126 readable source triangles; its volume is 1.67% below the coarse
+surface. Those checks support using the denser data but do not establish exact
+Advisor equivalence. The other six current inputs, all CSV/INI companions, and
+all six original samples remain byte-for-byte unchanged from the polygon build.
+Independent synthetic checks verify intact-coordinate preservation and rejection
+of inconsistent source connectivity. Input files were retained during testing.
 
 The later `31-8-AU9-477.19-345++16-1.adv` input stores its five counted
 Galaxy symbols in code order `1, 2, 3, 4, 0`. Counted tables are now bound by
@@ -212,3 +229,40 @@ conversion details for MeshLab review.
 Because ADV is proprietary and the samples show multiple damaged/variant record
 layouts, broader production compatibility requires more samples from every
 Advisor version and scanner workflow that must be supported.
+
+## September 22 container and scan recovery
+
+All 30 files in the supplied `Downloads/New folder` batch convert to 107 OBJ
+files and 30 CSV/INI pairs. All 107 meshes pass finite-coordinate, index-range,
+closed-edge and surface checks. The six original samples (67 files) and seven
+previous inputs (73 files) remain byte-identical to the preceding release.
+The tested single-file build is `Release/2026-09-22/ADV2OBJ.exe`.
+
+The `Downloads/New folder` inputs exposed additional formats. Cutting collections
+can appear tens of megabytes after the rough record. When the normal cache window
+contains no plan, the decoder searches typed cut records throughout the container.
+It exports the first readable stored plan and explicitly asks the user to verify
+plan selection; a missing cache does not establish which historical plan was active.
+Signed `-1` root-piece identifiers are supported. Invalid source-piece references
+are rejected while looking for another complete collection. If incomplete root
+ancestry erases a cut entirely, its stored slab is retained with a review warning.
+
+A counted scan recovery handles small gaps in triangle records, including gaps
+sharing a vertex. It retains at least 99% readable source triangles, opens only
+small local patches, restores any interior scan vertices without moving their
+coordinates, and requires the declared face count and closed edge connectivity.
+Duplicate or conflicting connectivity is rejected. Shifted coordinate records can
+use an independently validated polygon surface as an alignment guide. This path
+also supports the 55,098-vertex input. Previously successful decoders retain
+priority for shifted scans. Intact typed mesh counts take precedence over assuming
+that every closed surface satisfies `F = 2V - 4`.
+
+Bounded Galaxy tables with repeated internal codes are accepted when every label
+ordinal is distinct and both stored copies of each coordinate triple match.
+The exported coordinates remain unchanged; missing ordinals are rejected.
+
+Synthetic tests cover touching triangle gaps, unchanged coordinates, conflicting
+triangles, non-spherical topology, distant root cuts, incomplete root ancestry,
+and duplicate-code symbol tables. These recoveries use input records, never sample
+filenames, hashes, or reference-output substitutions. Review warnings remain
+necessary; conversion success does not prove exact Advisor equivalence.

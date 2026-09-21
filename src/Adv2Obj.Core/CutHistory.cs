@@ -13,7 +13,7 @@ public sealed partial class AdvToObjConverter
     private sealed record GroupCut(CutPlane Plane, uint Branch);
     private sealed record CutGroup(List<GroupCut> Cuts, int Piece);
 
-    private static List<CutGroup> DecodeCutGroups(byte[] data, List<CutPlane> activeCuts)
+    private static List<CutGroup> DecodeCutGroups(byte[] data, List<CutPlane> activeCuts, bool allowRootSentinel = false)
     {
         if (activeCuts.Count == 0) return [];
         var names = activeCuts.Select(cut => cut.Name).ToHashSet(StringComparer.Ordinal);
@@ -31,7 +31,8 @@ public sealed partial class AdvToObjConverter
             int end = start + 24 + (int)length;
             int piece = unchecked((int)ReadUInt32(data, end - 4));
             uint count = ReadUInt32(data, start + 24);
-            if (piece < 0 || count == 0 || count > activeCuts.Count) continue;
+            if ((piece < 0 && !(allowRootSentinel && piece == -1)) || piece > 100_000
+                || count == 0 || count > activeCuts.Count) continue;
             List<GroupCut> records = [];
             int cursor = start + 28;
             for (int i = 0; i < count; i++)
@@ -55,6 +56,7 @@ public sealed partial class AdvToObjConverter
             if (records.Count != count || cursor != end - 8) continue;
             bool pie = records.All(item => item.Plane.Name.StartsWith("Pie", StringComparison.Ordinal));
             if (pie ? records.Count != 2 : records.Any(item => !item.Plane.Name.StartsWith("Saw", StringComparison.Ordinal))) continue;
+            if (allowRootSentinel && !pie && records.Select(item => item.Branch).Distinct().Count() != records.Count) continue;
             if (records.Any(item => found.Contains(item.Plane.Name)))
             {
                 groups.Clear();
@@ -62,10 +64,17 @@ public sealed partial class AdvToObjConverter
             }
             groups.Add(new(records, piece));
             foreach (var item in records) found.Add(item.Plane.Name);
-            if (found.SetEquals(names)) return groups;
+            if (found.SetEquals(names))
+            {
+                if (groups.All(g => g.Cuts[0].Plane.Name.StartsWith("Pie", StringComparison.Ordinal)
+                    || g.Piece <= 0 || groups.Any(p => p.Piece == g.Piece
+                        && p.Cuts[0].Plane.Name.StartsWith("Pie", StringComparison.Ordinal)))) return groups;
+                groups.Clear();
+                found.Clear();
+            }
             position = end;
         }
-        return [];
+        return allowRootSentinel ? [] : DecodeCutGroups(data, activeCuts, allowRootSentinel: true);
     }
 
     private static Mesh ApplyCutHistory(Mesh slice, CutPlane cut, List<CutGroup> groups)
@@ -73,7 +82,7 @@ public sealed partial class AdvToObjConverter
         CutGroup? owner = groups.FirstOrDefault(group => group.Cuts.Any(item => item.Plane.Name == cut.Name));
         if (owner is null) return slice;
         bool isPie = cut.Name.StartsWith("Pie", StringComparison.Ordinal);
-        if (!isPie && owner.Piece != 0 && !groups.Any(group => group.Piece == owner.Piece
+        if (!isPie && owner.Piece > 0 && !groups.Any(group => group.Piece == owner.Piece
             && group.Cuts[0].Plane.Name.StartsWith("Pie", StringComparison.Ordinal)))
             throw new AdvFormatException($"The source piece for {cut.Name} is missing from its cutting plan.");
         foreach (CutGroup group in groups.Where(group => group.Cuts[0].Plane.Name.StartsWith("Pie", StringComparison.Ordinal)))
@@ -94,12 +103,15 @@ public sealed partial class AdvToObjConverter
             // positive child 2*n+1, negative child 2*n+2. Each branch excludes
             // its parent's kerf, using the appropriate outer/inner plane.
             uint branch = owner.Cuts.Single(item => item.Plane.Name == cut.Name).Branch;
+            Mesh beforeAncestors = slice;
+            bool missingAncestor = false;
             while (branch > 0)
             {
                 uint parent = (branch - 1) / 2;
                 GroupCut? ancestor = owner.Cuts.FirstOrDefault(item => item.Branch == parent);
                 if (ancestor is null)
                 {
+                    missingAncestor = true;
                     slice.Warnings.Add(
                         $"{cut.Name}: cutting-tree branch {parent} is absent; applied the remaining recorded ancestors and requires visual review.");
                     branch = parent;
@@ -109,6 +121,11 @@ public sealed partial class AdvToObjConverter
                 slice = ClipClosedMesh(slice, ancestor.Plane.Normal,
                     ancestor.Plane.Distance - (lesserSide ? ancestor.Plane.Width : 0), lesserSide);
                 branch = parent;
+            }
+            if (owner.Piece == -1 && missingAncestor && (slice.Vertices.Count < 4 || slice.Faces.Count < 4))
+            {
+                beforeAncestors.Warnings.Add($"{cut.Name}: the incomplete root cutting tree erased the slice; exported the stored cut-plane slab without uncertain ancestor constraints. Requires visual review.");
+                return beforeAncestors;
             }
         }
         return slice;

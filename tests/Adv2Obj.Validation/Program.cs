@@ -1,6 +1,26 @@
 using Adv2Obj.Core;
 
-if (args is ["--mesh-diagnostic", string diagnosticInput, string diagnosticOutput])
+if (args is ["--recovery-diagnostic", string payloadFile])
+{
+    System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
+    byte[] payload = File.ReadAllBytes(payloadFile);
+    foreach (string name in new[] { "DecodeMesh", "TryRecoverDeclaredMesh", "TryRecoverSegmentedMesh", "TryRecoverPolygonMesh" })
+    {
+        Console.WriteLine(name);
+        try
+        {
+            var method = typeof(AdvToObjConverter).GetMethod(name,
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            object? result = method.Invoke(null, name == "DecodeMesh" ? [payload]
+                : name == "TryRecoverDeclaredMesh" ? [payload, CancellationToken.None, true] : [payload, CancellationToken.None]);
+            Console.WriteLine(result is null ? "No recovery" : result.ToString());
+        }
+        catch (Exception error) { Console.WriteLine(error.GetBaseException().Message); }
+    }
+    return;
+}
+
+if (args is ["--mesh-diagnostic" or "--payload-diagnostic", string diagnosticInput, string diagnosticOutput])
 {
     System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
     Directory.CreateDirectory(diagnosticOutput);
@@ -12,7 +32,8 @@ if (args is ["--mesh-diagnostic", string diagnosticInput, string diagnosticOutpu
         {
             var decoded = ((byte[] Payload, int End, bool Alternate))method.Invoke(null, [File.ReadAllBytes(file)])!;
             File.WriteAllBytes(Path.Combine(diagnosticOutput, Path.GetFileName(file) + ".bin"), decoded.Payload);
-            await new AdvToObjConverter().ConvertAsync(file, diagnosticOutput);
+            Console.WriteLine($"{Path.GetFileName(file)}: payload {decoded.Payload.Length} bytes, ends at {decoded.End}");
+            if (args[0] == "--mesh-diagnostic") await new AdvToObjConverter().ConvertAsync(file, diagnosticOutput);
         }
         catch (Exception error) { Console.WriteLine($"{Path.GetFileName(file)}: {error.GetBaseException().Message}"); }
     }

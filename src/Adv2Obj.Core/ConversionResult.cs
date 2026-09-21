@@ -10,6 +10,7 @@ public sealed record ConversionResult(
     IReadOnlyList<string> Warnings)
 {
     public bool UsesCoarseSurface { get; init; }
+    public bool UsesRecoveredScanSurface { get; init; }
 }
 
 public sealed record ConversionAndCleanupResult(

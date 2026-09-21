@@ -120,6 +120,7 @@ public partial class MainWindow : Window
                     item.Status = !deleteAfterConversion || outcome.InputRemoved ? "Completed" : "Input retained";
                     ConversionResult result = outcome.Conversion;
                     if (result.UsesCoarseSurface) item.Status = "Review (coarse)";
+                    if (result.UsesRecoveredScanSurface) item.Status = "Review (scan)";
                     item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
                     if (result.RepairedVertexCount > 0)
                     {

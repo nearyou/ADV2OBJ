@@ -134,7 +134,8 @@ public sealed partial class AdvToObjConverter
     }
 
     private static (List<Vertex> Vertices, int Repaired) ReadAlignedVertices(
-        byte[] payload, int start, int count, int faceCount, CancellationToken cancellationToken)
+        byte[] payload, int start, int count, int faceCount, CancellationToken cancellationToken,
+        Mesh? surfaceGuide = null)
     {
         int missing = -1;
         long declaredLength = 8L + count * 24L + faceCount * 16L;
@@ -150,6 +151,8 @@ public sealed partial class AdvToObjConverter
         var previous = Enumerable.Repeat(double.NegativeInfinity, states).ToArray();
         previous[missing] = 0;
         var previousVertices = new Vertex[states];
+        var guide = surfaceGuide is null ? null : new ScanSurfaceGuide(surfaceGuide);
+        var guideCosts = new Dictionary<int, double>();
         double[] scales = new double[3];
         for (int axis = 0; axis < 3; axis++)
         {
@@ -174,7 +177,8 @@ public sealed partial class AdvToObjConverter
             var nextVertices = new Vertex[states];
             for (int state = 0; state < states; state++)
             {
-                Vertex v = ReadVertex(payload, start + i * 24 + state);
+                int address = start + i * 24 + state;
+                Vertex v = ReadVertex(payload, address);
                 nextVertices[state] = v;
                 int good = (IsSymbolCoordinate(v.X) ? 1 : 0)
                     + (IsSymbolCoordinate(v.Y) ? 1 : 0) + (IsSymbolCoordinate(v.Z) ? 1 : 0);
@@ -193,7 +197,14 @@ public sealed partial class AdvToObjConverter
                     if (score > best) { best = score; parent = candidate; }
                 }
                 history[i, state] = (byte)parent;
-                next[state] = best + good * 4 + (good == 3 ? 6 : 0);
+                double guideCost = 0;
+                if (guide is not null && !guideCosts.TryGetValue(address, out guideCost))
+                {
+                    double distance = good == 3 ? guide.SignedDistance(v) : double.PositiveInfinity;
+                    guideCost = Math.Min(120, Math.Abs(distance) / (guide.Scale * .002) * (distance > 0 ? 15 : 10));
+                    guideCosts[address] = guideCost;
+                }
+                next[state] = best + good * 4 + (good == 3 ? 6 : 0) - guideCost;
             }
             previous = next;
             previousVertices = nextVertices;

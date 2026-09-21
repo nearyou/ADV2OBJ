@@ -8,6 +8,9 @@ public sealed partial class AdvToObjConverter
     private sealed record PolygonRecord(int End, List<Vertex> Vertices, List<int[]> Polygons);
 
     private static Mesh? TryRecoverPolygonMesh(byte[] payload, CancellationToken token)
+        => RecoverPolygonMesh(payload, token, allowScanRefinement: true);
+
+    private static Mesh? RecoverPolygonMesh(byte[] payload, CancellationToken token, bool allowScanRefinement)
     {
         // Advisor stores two copies of a coarser polygon surface immediately
         // before the dense scan mesh. Only use that paired representation after
@@ -65,6 +68,8 @@ public sealed partial class AdvToObjConverter
                 }
                 if (hull.Vertices.Count < count * .97 || supported < polygons.Count * .9) continue;
                 ValidateClosedTopology(hull.Vertices.Count, hull.Faces);
+                Mesh? refined = allowScanRefinement ? TryRefinePolygonSurface(payload, dense, hull, token) : null;
+                if (refined is not null) return refined;
                 hull.Warnings.Add($"Dense scan mesh could not be decoded; recovered the stored polygon surface "
                     + $"({hull.Vertices.Count:N0} vertices; {supported}/{polygons.Count} readable source polygons verified). "
                     + "This is a coarser surface, not an exact dense-scan export; review it in MeshLab.");

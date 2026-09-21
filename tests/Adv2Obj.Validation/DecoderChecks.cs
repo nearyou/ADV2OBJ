@@ -78,6 +78,34 @@ internal static class DecoderChecks
                 "A counted Galaxy table must bind records by code without requiring physical code order.");
             Console.WriteLine("PASS counted Galaxy symbols can be serialized out of code order.");
 
+            using var ordinalData = new MemoryStream();
+            ordinalData.Write(source.AsSpan(0, galaxyHeader));
+            using (var writer = new BinaryWriter(ordinalData, Encoding.UTF8, true))
+            {
+                writer.Write(galaxySignature); writer.Write(2); writer.Write(12 + 3 * 80);
+                writer.Write(new byte[8]); writer.Write(3);
+                for (int i = 0; i < 3; i++)
+                {
+                    writer.Write(i == 2 ? 0 : i); writer.Write(i); writer.Write(1); writer.Write(0);
+                    for (int duplicate = 0; duplicate < 2; duplicate++)
+                    { writer.Write(100.0 + i); writer.Write(200.0 + i); writer.Write(300.0 + i); }
+                    writer.Write(new byte[16]);
+                }
+            }
+            string ordinalInput = Path.Combine(temporary, "ordinal-symbols.adv");
+            File.WriteAllBytes(ordinalInput, ordinalData.ToArray());
+            var ordinalResult = await converter.ConvertAsync(ordinalInput, output);
+            Require(File.ReadAllLines(Path.Combine(ordinalResult.OutputDirectory, "ordinal-symbols_GalaxySymbols.csv"))
+                .SequenceEqual(symbols), "Duplicate codes must not replace distinct labels in a bounded symbol table.");
+            byte[] invalidOrdinal = ordinalData.ToArray();
+            BitConverter.GetBytes(0).CopyTo(invalidOrdinal, galaxyHeader + 32 + 2 * 80 + 4);
+            File.WriteAllBytes(ordinalInput, invalidOrdinal);
+            bool rejected = false;
+            try { await converter.ConvertAsync(ordinalInput, output); }
+            catch (AdvFormatException) { rejected = true; }
+            Require(rejected, "A missing label ordinal must not produce an incomplete symbol export.");
+            Console.WriteLine("PASS bounded duplicate-code symbols: exact coordinates and labels retained; missing ordinal rejected.");
+
             string renamed = Path.Combine(temporary, "different-name.adv");
             File.WriteAllBytes(renamed, source);
             ConversionResult renamedResult = await converter.ConvertAsync(renamed, output);
@@ -112,6 +140,7 @@ internal static class DecoderChecks
             }
             Console.WriteLine("PASS zero-based and one-based Pie pairing.");
             await CheckCutHistory(converter, temporary, output, vertices, faces);
+            await CheckDistantRootCut(converter, temporary, output, vertices, faces);
             await CheckPointRecovery(converter, temporary, output);
         }
         finally
@@ -242,6 +271,33 @@ internal static class DecoderChecks
             Require(File.ReadAllBytes(obj).SequenceEqual(File.ReadAllBytes(Path.Combine(renamedResult.OutputDirectory,
                 "renamed-history" + Path.GetFileName(obj)["history".Length..]))), "Cut history must be independent of the filename.");
         Console.WriteLine("PASS source-piece history, both saw branches, concave caps, and renamed input.");
+    }
+
+    private static async Task CheckDistantRootCut(AdvToObjConverter converter, string temporary, string output,
+        List<(double X, double Y, double Z)> vertices, List<(int A, int B, int C)> faces)
+    {
+        using var data = new MemoryStream();
+        data.Write(BuildAdv(vertices, faces, damaged: false, cut: false));
+        data.Write(new byte[6_000_000]);
+        using (var writer = new BinaryWriter(data, Encoding.UTF8, true))
+            WriteGroup(writer, -1, new TestCut("Saw3-1", 500, (0, 0, 1)));
+        string path = Path.Combine(temporary, "distant-cut.adv");
+        File.WriteAllBytes(path, data.ToArray());
+        var result = await converter.ConvertAsync(path, output);
+        var points = ReadVertices(Path.Combine(result.OutputDirectory, "distant-cut_Saw3-1.obj"));
+        Require(points.All(v => v.Z >= 450 - 1e-8 && v.Z <= 500 + 1e-8),
+            "Distant root cut must retain its stored plane equation.");
+        Require(result.ObjectFileCount == 2, "Cut collection beyond the cache window was missed.");
+        using var incomplete = new MemoryStream();
+        incomplete.Write(BuildAdv(vertices, faces, damaged: false, cut: false));
+        using (var writer = new BinaryWriter(incomplete, Encoding.UTF8, true))
+            WriteGroup(writer, -1, new TestCut("Saw3-1", 800, (0, 0, 1)),
+                new TestCut("Saw3-2", 500, (0, 0, 1), 9));
+        File.WriteAllBytes(path, incomplete.ToArray());
+        result = await converter.ConvertAsync(path, output);
+        Require(result.ObjectFileCount == 3 && result.Warnings.Any(w => w.Contains("without uncertain ancestor")),
+            "An incomplete root tree must preserve the stored slab with an explicit warning.");
+        Console.WriteLine("PASS distant cutting collection and signed root-piece sentinel.");
     }
 
     private static async Task CheckPointRecovery(AdvToObjConverter converter, string temporary, string output)
