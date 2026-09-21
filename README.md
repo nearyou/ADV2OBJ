@@ -134,6 +134,10 @@ these records when the entire counted table remains identifiable and flags the
 reduced coordinate precision for review.
 Some counted tables contain an explicitly inactive, zero-filled symbol slot;
 the converter omits that slot and exports every active symbol record.
+Counted Galaxy tables are also accepted when the count follows the table header
+at the alternate offsets used by the supplied files. A variant-1 symbol record
+with a two-byte header loss is recovered only when its remaining header, table
+code, ordinal, and coordinates all validate; the repair is reported for review.
 
 Additional inputs have different record layouts or records the decoder cannot
 fully interpret. The decoder can
@@ -145,8 +149,56 @@ source diagonals. This recovery requires every input point to be retained and at
 least 80% of the resulting triangles to match surviving source records. The
 remaining triangles are explicitly reported as reconstructed. Other topology
 repairs and alternate embedded meshes remain fallbacks and carry review warnings.
-In the 177-file `adv-in` regression corpus, 172 convert and five still fail; this
-does not establish exact Advisor export equivalence or universal ADV support.
+An earlier run of the 177-file `adv-in` regression corpus converted 172 files;
+that historical result does not establish exact Advisor export equivalence or
+universal ADV support.
+
+In the 13-file `fail` set supplied on September 21, seven now complete through
+the normal data-driven pipeline. Two partially damaged rough meshes recover from
+their declared vertex/face counts and surviving low index bytes. Three additional
+Galaxy table layouts are decoded. A stored cut lying wholly outside the rough
+mesh is treated as inactive and omitted with a warning, and a saw tree with a
+missing intermediate branch applies its remaining recorded ancestors and reports
+the missing branch. The resulting 65 OBJ files pass finite-coordinate, index,
+and closed-edge validation. A subsequent recovery improvement also converts
+`27_8_396.83A-A2.2-1291-7-1.adv`: its uncompressed mesh contains multiple byte
+deletions. The fallback anchors coordinate alignment to the declared record
+length and the face table, preserving vertex numbering across the shifts. It
+retains all 8,515 vertices and 17,022 source triangles, reconstructs four missing
+triangles, and repairs 112 vertices. The resulting ten OBJ files and CSV/INI
+companions require visual review; exact Advisor equivalence has not been verified.
+This recovery requires at least 99% readable source triangles, consistent directed
+edge connectivity, small simple boundary loops, and closed final topology.
+It never uses input names or sample-output substitutions.
+
+The five remaining dense-mesh failures now export through a polygon-surface
+fallback. It reads the paired polygon records preceding the dense scan record
+and requires the duplicate coordinate blocks to agree. Record lengths, polygon
+counts, surviving polygon planes, retained points and closed topology validate
+the recovered surface. Invalid coordinates can be repaired from incident source
+planes or a uniquely supported high-byte correction. A repeated cap sign error
+is corrected only when it improves point retention and source-plane agreement.
+
+These are **coarser source surfaces**, not exact dense-scan exports. The UI marks
+them `Review (coarse)` and explains the recovery in Details. Existing successful
+decoders retain priority. No sample names, hashes, or reference-output lookups are
+used. The current seven-file `Downloads/input` batch produces 59 OBJ files plus
+seven CSV/INI pairs, with no conversion failures. All 59 OBJs pass finite-value,
+index and closed-edge validation. The six original samples still produce the
+same 67 output files byte-for-byte as the preceding build.
+
+| Recovered input | OBJ files | Polygon surface vertices |
+| --- | ---: | ---: |
+| `1_9_457.62C-A2.1-726-7-1.adv` | 10 | 614 |
+| `18-8-AU3-396.52-14++57-1.adv` | 7 | 462 |
+| `31_8_457.62C-A2.1-4-8-1.adv` | 8 | 919 |
+| `31_8_457.62C-A2.1-7.adv` | 9 | 754 |
+| `31_8_457.62C-A2.1-8-8-1.adv` | 11 | 608 |
+
+The later `31-8-AU9-477.19-345++16-1.adv` input stores its five counted
+Galaxy symbols in code order `1, 2, 3, 4, 0`. Counted tables are now bound by
+their stored code and ordinal without requiring code zero to be physically first.
+It completes with four OBJ files plus its CSV and INI companions.
 
 The six additional files described as Advisor 7.6 in `D:\ADV2OBJ\For-obj\76-new` also
 produce complete folders. Two files lose bytes within a vertex record; the

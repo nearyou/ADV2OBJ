@@ -1,5 +1,24 @@
 using Adv2Obj.Core;
 
+if (args is ["--mesh-diagnostic", string diagnosticInput, string diagnosticOutput])
+{
+    System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
+    Directory.CreateDirectory(diagnosticOutput);
+    var method = typeof(AdvToObjConverter).GetMethod("DecompressRoughPayload",
+        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+    foreach (string file in Directory.EnumerateFiles(diagnosticInput, "*.adv"))
+    {
+        try
+        {
+            var decoded = ((byte[] Payload, int End, bool Alternate))method.Invoke(null, [File.ReadAllBytes(file)])!;
+            File.WriteAllBytes(Path.Combine(diagnosticOutput, Path.GetFileName(file) + ".bin"), decoded.Payload);
+            await new AdvToObjConverter().ConvertAsync(file, diagnosticOutput);
+        }
+        catch (Exception error) { Console.WriteLine($"{Path.GetFileName(file)}: {error.GetBaseException().Message}"); }
+    }
+    return;
+}
+
 if (args is ["--surface-check", string surfaceRoot])
 {
     int checkedMeshes = 0;

@@ -16,6 +16,7 @@ public sealed partial class AdvToObjConverter
     private static readonly byte[] ZippedDataName = Encoding.ASCII.GetBytes("ZippedData");
     private static readonly byte[] GalaxyTableSignature =
         [0xF3, 0x6B, 0xED, 0x43, 0xB3, 0x32, 0xFA, 0x60, 0x7E, 0xE3, 0x55, 0x1D];
+    private const int GalaxySearchWindow = 8_000_000;
 
     // Sparse bit masks observed in the supplied Advisor data. XOR removes the
     // mask while retaining the original triangle index.
@@ -113,11 +114,13 @@ public sealed partial class AdvToObjConverter
                 }
                 catch (AdvFormatException primaryError)
                 {
-                    mesh = FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                    mesh = TryRecoverSegmentedMesh(payload, cancellationToken)
+                        ?? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                        ?? TryRecoverPolygonMesh(payload, cancellationToken)
                         ?? throw new AdvFormatException(
                             $"{primaryError.Message} No complete alternate mesh was found.");
                     mesh.Warnings.Add(
-                        "Primary rough mesh is damaged; recovered a closed alternate mesh from the ADV. Verify its shape in MeshLab.");
+                        "Primary rough mesh required recovery. Verify its shape in MeshLab.");
                 }
             }
         }
@@ -160,15 +163,19 @@ public sealed partial class AdvToObjConverter
             "Rough",
             cancellationToken);
 
+        int objectFileCount = 1;
         foreach (CutPlane cut in cuts)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Mesh slice = SliceMesh(cuttingMesh, cut, cuts, groups);
+            Mesh? slice = SliceMesh(cuttingMesh, cut, cuts, groups);
+            if (slice is null) continue;
+            if (mesh.UsesCoarseSurface) slice = slice with { UsesCoarseSurface = true };
             await WriteObjAtomicallyAsync(
                 Path.Combine(stagingDirectory, $"{stem}_{cut.Name}.obj"),
                 slice,
                 cut.Name,
                 cancellationToken);
+            objectFileCount++;
         }
 
         await WriteSawsIniAsync(
@@ -190,11 +197,11 @@ public sealed partial class AdvToObjConverter
         return new ConversionResult(
             inputPath,
             outputDirectory,
-            cuts.Count + 1,
+            objectFileCount,
             mesh.Vertices.Count,
             mesh.Faces.Count,
             mesh.RepairedVertexCount,
-            warnings);
+            warnings) { UsesCoarseSurface = mesh.UsesCoarseSurface };
         }
         finally
         {
@@ -309,6 +316,7 @@ public sealed partial class AdvToObjConverter
             if (nameOffset < 0)
             {
                 return FindRawMeshPayload(source, metadataOffset)
+                    ?? FindSegmentedRawPayload(source, metadataOffset)
                     ?? throw new AdvFormatException(
                         "No complete embedded ZIP or uncompressed rough mesh was found.");
             }
@@ -593,7 +601,7 @@ public sealed partial class AdvToObjConverter
         return false;
     }
 
-    private static Mesh SliceMesh(Mesh source, CutPlane cut, List<CutPlane> cuts, List<CutGroup> groups)
+    private static Mesh? SliceMesh(Mesh source, CutPlane cut, List<CutPlane> cuts, List<CutGroup> groups)
     {
         Mesh upper = ClipClosedMesh(source, cut.Normal, cut.Distance, keepLessOrEqual: true);
         Mesh slab = ClipClosedMesh(
@@ -601,6 +609,15 @@ public sealed partial class AdvToObjConverter
             cut.Normal,
             cut.Distance - cut.Width,
             keepLessOrEqual: false);
+        if (slab.Vertices.Count < 4 || slab.Faces.Count < 4)
+        {
+            double minimum = source.Vertices.Min(vertex => Dot(cut.Normal, vertex));
+            double maximum = source.Vertices.Max(vertex => Dot(cut.Normal, vertex));
+            source.Warnings.Add(
+                $"{cut.Name}: the stored cut lies outside the rough mesh "
+                + $"(mesh range {minimum:G8}..{maximum:G8}, cut {cut.Distance - cut.Width:G8}..{cut.Distance:G8}); no OBJ was emitted for this inactive cut.");
+            return null;
+        }
 
         // Advisor pie cuts are made in opposed pairs. Each exported kerf stops
         // at the inner face of its companion cut rather than passing through
@@ -641,9 +658,10 @@ public sealed partial class AdvToObjConverter
         {
             double minimum = source.Vertices.Min(vertex => Dot(cut.Normal, vertex));
             double maximum = source.Vertices.Max(vertex => Dot(cut.Normal, vertex));
-            throw new AdvFormatException(
-                $"Cut object {cut.Name} does not intersect the rough mesh "
-                + $"(mesh range {minimum:G8}..{maximum:G8}, cut {cut.Distance - cut.Width:G8}..{cut.Distance:G8}).");
+            source.Warnings.Add(
+                $"{cut.Name}: recorded piece/history constraints leave no mesh "
+                + $"(rough range {minimum:G8}..{maximum:G8}, cut {cut.Distance - cut.Width:G8}..{cut.Distance:G8}); no OBJ was emitted and visual review is required.");
+            return null;
         }
         int invalidEdges = CountInvalidEdges(slab.Faces);
         if (invalidEdges > 0)
@@ -862,7 +880,7 @@ public sealed partial class AdvToObjConverter
     {
         string[] labels = ["X", "T", "V", "(X)", "(T)", "(V)", "K"];
         List<GalaxyCandidate> candidates = [];
-        int start = Math.Max(0, source.Length - 4_000_000);
+        int start = Math.Max(0, source.Length - GalaxySearchWindow);
         for (int offset = start; offset <= source.Length - 64; offset++)
         {
             uint code = ReadUInt32(source, offset);
@@ -872,10 +890,20 @@ public sealed partial class AdvToObjConverter
             if (code > 20 || ordinal >= labels.Length) continue;
 
             int coordinateOffset;
+            bool repaired = false;
             if ((variant == 0 && reserved == 0)
                 || (variant == 1 && reserved <= 1))
             {
                 coordinateOffset = offset + 16;
+            }
+            else if (variant == 1 && ReadUInt16(source, offset + 12) == 0)
+            {
+                // Some records lose two bytes between the variant header and
+                // the duplicated coordinate block. The remaining two zero
+                // reserved bytes and the enclosing counted table disambiguate
+                // this from an ordinary record.
+                coordinateOffset = offset + 14;
+                repaired = true;
             }
             else if (variant == 2 && reserved == 1)
             {
@@ -891,7 +919,7 @@ public sealed partial class AdvToObjConverter
                 ReadDouble(source, coordinateOffset + 8),
                 ReadDouble(source, coordinateOffset + 16));
             if (!IsGalaxyPosition(position)) continue;
-            candidates.Add(new GalaxyCandidate(offset, (int)code, (int)ordinal, position));
+            candidates.Add(new GalaxyCandidate(offset, (int)code, (int)ordinal, position, repaired));
         }
 
         // Prefer an explicitly bounded table to a guessed six-symbol sequence.
@@ -965,36 +993,75 @@ public sealed partial class AdvToObjConverter
     private static List<GalaxyCandidate>? FindGuidGalaxyTable(
         byte[] source, List<GalaxyCandidate> candidates)
     {
-        int search = Math.Max(0, source.Length - 4_000_000);
+        int search = Math.Max(0, source.Length - GalaxySearchWindow);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
             search++;
             if (header > source.Length - 32) continue;
-            uint count = ReadUInt32(source, header + 28);
-            if (count is < 3 or > 7) continue;
-            int firstOffset = header + 32;
-            List<GalaxyCandidate> table = candidates
-                .Where(candidate => candidate.Offset >= firstOffset
-                    && candidate.Offset <= firstOffset + 500_000
-                    && candidate.Code < count
-                    && ReadUInt32(source, candidate.Offset + 8) is 1 or 2)
-                .Take((int)count)
-                .ToList();
-            if (table.Count == count
-                && table[0].Offset == firstOffset
-                && table.Select(item => item.Code).Distinct().Count() == count
-                && table.Select(item => item.Ordinal).Distinct().Count() == count)
+            // Advisor variants place the count at +28 or +32. A two-byte loss
+            // before the table shifts it to +30. Records are variable length,
+            // so bind them by their serialized code rather than a fixed stride.
+            foreach (int countOffset in new[] { 28, 30, 32 })
             {
-                return table;
+                uint count = ReadUInt32(source, header + countOffset);
+                if (count is < 3 or > 7) continue;
+                int firstOffset = header + countOffset + 4;
+                List<GalaxyCandidate>? table = SelectDeclaredGalaxyTable(
+                    source, candidates, firstOffset, (int)count);
+                if (table is not null) return table;
             }
         }
         return null;
     }
 
+    private static List<GalaxyCandidate>? SelectDeclaredGalaxyTable(
+        byte[] source, List<GalaxyCandidate> candidates, int firstOffset, int count)
+    {
+        List<GalaxyCandidate>[] byCode = Enumerable.Range(0, count)
+            .Select(code => candidates
+                .Where(candidate => candidate.Code == code
+                    && candidate.Offset >= firstOffset
+                    && candidate.Offset <= firstOffset + 500_000
+                    && ReadUInt32(source, candidate.Offset + 8) is 1 or 2)
+                .GroupBy(candidate => candidate.Ordinal)
+                .Select(group => group.OrderBy(candidate => candidate.Offset).First())
+                .ToList())
+            .ToArray();
+        if (byCode.Any(group => group.Count == 0)) return null;
+
+        List<GalaxyCandidate>? best = null;
+        int bestSpan = int.MaxValue;
+        void Search(int code, List<GalaxyCandidate> selected, HashSet<int> ordinals)
+        {
+            if (code == count)
+            {
+                int minimum = selected.Min(item => item.Offset);
+                int maximum = selected.Max(item => item.Offset);
+                int span = maximum - minimum;
+                if (minimum == firstOffset && span < bestSpan)
+                {
+                    bestSpan = span;
+                    best = [.. selected];
+                }
+                return;
+            }
+            foreach (GalaxyCandidate candidate in byCode[code])
+            {
+                if (!ordinals.Add(candidate.Ordinal)) continue;
+                selected.Add(candidate);
+                Search(code + 1, selected, ordinals);
+                selected.RemoveAt(selected.Count - 1);
+                ordinals.Remove(candidate.Ordinal);
+            }
+        }
+        Search(0, [], []);
+        return best;
+    }
+
     private static List<GalaxyCandidate>? FindShiftedVariant2GalaxyTable(byte[] source)
     {
-        int search = Math.Max(0, source.Length - 4_000_000);
+        int search = Math.Max(0, source.Length - GalaxySearchWindow);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
@@ -1060,7 +1127,7 @@ public sealed partial class AdvToObjConverter
     private static List<GalaxyCandidate>? FindGalaxyTableWithInactiveSlot(
         byte[] source, List<GalaxyCandidate> candidates)
     {
-        int search = Math.Max(0, source.Length - 4_000_000);
+        int search = Math.Max(0, source.Length - GalaxySearchWindow);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
@@ -1139,7 +1206,7 @@ public sealed partial class AdvToObjConverter
 
     private static bool HasInactiveGalaxySlot(byte[] source)
     {
-        int search = Math.Max(0, source.Length - 4_000_000);
+        int search = Math.Max(0, source.Length - GalaxySearchWindow);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
@@ -1267,6 +1334,10 @@ public sealed partial class AdvToObjConverter
         {
             faceStart = checked(payload.Length - 4 - encodedFaceCount * 16);
         }
+        bool damagedWordVariant = inferredVertexCount > 0
+            && !Enumerable.Range(0, Math.Min(32, inferredVertexCount))
+                .All(index => IsPlausible(ReadVertex(payload,
+                    faceStart - inferredVertexCount * 24 + index * 24)));
 
         List<(uint Marker, uint A, uint B, uint C)> records = new(encodedFaceCount);
         List<uint> plausibleIndices = [];
@@ -1278,6 +1349,12 @@ public sealed partial class AdvToObjConverter
             uint a = ReadUInt32(payload, offset + 4) ^ mask;
             uint b = ReadUInt32(payload, offset + 8) ^ mask;
             uint c = ReadUInt32(payload, offset + 12) ^ mask;
+            if (damagedWordVariant && FaceMarkers.Contains(marker))
+            {
+                a = RecoverLowThreeByteIndex(a, inferredVertexCount);
+                b = RecoverLowThreeByteIndex(b, inferredVertexCount);
+                c = RecoverLowThreeByteIndex(c, inferredVertexCount);
+            }
             records.Add((marker, a, b, c));
             uint generousLimit = (uint)(encodedFaceCount / 2 + 1024);
             if (inferredVertexCount == 0 || FaceMarkers.Contains(marker))
@@ -1303,11 +1380,23 @@ public sealed partial class AdvToObjConverter
         }
 
         Vertex?[] decodedVertices = new Vertex?[vertexCount];
+        HashSet<int> repairedCoordinates = [];
         for (int index = 0; index < vertexCount; index++)
         {
-            decodedVertices[index] = ReadVertex(payload, vertexStart + index * 24);
+            int offset = vertexStart + index * 24;
+            Vertex vertex = ReadVertex(payload, offset);
+            if (damagedWordVariant)
+            {
+                bool repaired = false;
+                double x = RecoverRepeatedWordCoordinate(payload, offset, vertex.X, ref repaired);
+                double y = RecoverRepeatedWordCoordinate(payload, offset + 8, vertex.Y, ref repaired);
+                double z = RecoverRepeatedWordCoordinate(payload, offset + 16, vertex.Z, ref repaired);
+                vertex = new Vertex(x, y, z);
+                if (repaired) repairedCoordinates.Add(index);
+            }
+            decodedVertices[index] = vertex;
         }
-        HashSet<int> repairedCoordinates = RepairInvalidCoordinates(decodedVertices);
+        repairedCoordinates.UnionWith(RepairInvalidCoordinates(decodedVertices));
         List<Vertex> vertices = decodedVertices.Select(vertex => vertex!.Value).ToList();
 
         List<((int A, int B, int C) Face, double LongestEdge)> candidates = [];
@@ -1412,6 +1501,15 @@ public sealed partial class AdvToObjConverter
     private static (int FaceStart, int ReadableFaceCount, int VertexCount)? FindPartialFaceTable(
         byte[] payload)
     {
+        // Preserve the established decoder choice whenever its strict vertex
+        // boundary is present. Only then try the damaged-coordinate variant.
+        return FindPartialFaceTable(payload, allowDamagedCoordinates: false)
+            ?? FindPartialFaceTable(payload, allowDamagedCoordinates: true);
+    }
+
+    private static (int FaceStart, int ReadableFaceCount, int VertexCount)? FindPartialFaceTable(
+        byte[] payload, bool allowDamagedCoordinates)
+    {
         for (int offset = 4; offset <= payload.Length - 16; offset++)
         {
             if (ReadUInt32(payload, offset) != 3) continue;
@@ -1436,8 +1534,11 @@ public sealed partial class AdvToObjConverter
                 int vertexCount = (declaredCount + 4) / 2;
                 int vertexStart = offset - 4 - vertexCount * 24;
                 if (vertexStart >= 0
-                    && Enumerable.Range(0, Math.Min(32, vertexCount))
-                        .All(index => IsPlausible(ReadVertex(payload, vertexStart + index * 24))))
+                    && (allowDamagedCoordinates
+                        ? HasRecoverableVertexTable(payload, vertexStart, vertexCount)
+                        : Enumerable.Range(0, Math.Min(32, vertexCount))
+                            .All(index => IsPlausible(
+                                ReadVertex(payload, vertexStart + index * 24)))))
                 {
                     int readableCount = Math.Min(declaredCount, (payload.Length - offset) / 16);
                     return (offset - 4, readableCount, vertexCount);
@@ -1446,6 +1547,44 @@ public sealed partial class AdvToObjConverter
             offset = end - 1;
         }
         return null;
+    }
+
+    private static int CountPlausibleCoordinates(Vertex vertex) =>
+        (IsPlausibleCoordinate(vertex.X) ? 1 : 0)
+        + (IsPlausibleCoordinate(vertex.Y) ? 1 : 0)
+        + (IsPlausibleCoordinate(vertex.Z) ? 1 : 0);
+
+    private static bool HasRecoverableVertexTable(byte[] payload, int start, int count)
+    {
+        int samples = Math.Min(64, count);
+        int plausible = 0;
+        for (int sample = 0; sample < samples; sample++)
+        {
+            int index = samples == 1 ? 0 : sample * (count - 1) / (samples - 1);
+            if (CountPlausibleCoordinates(ReadVertex(payload, start + index * 24)) >= 2)
+                plausible++;
+        }
+        return plausible >= Math.Ceiling(samples * .9);
+    }
+
+    private static uint RecoverLowThreeByteIndex(uint value, int vertexCount)
+    {
+        if (value < vertexCount) return value;
+        uint recovered = value & 0x00ff_ffff;
+        return recovered < vertexCount ? recovered : value;
+    }
+
+    private static double RecoverRepeatedWordCoordinate(
+        byte[] payload, int offset, double value, ref bool repaired)
+    {
+        if (IsPlausibleCoordinate(value)) return value;
+        ulong bits = ReadUInt64(payload, offset);
+        uint low = (uint)bits;
+        if (low != (uint)(bits >> 32)) return value;
+        double candidate = BitConverter.Int64BitsToDouble(unchecked((long)((ulong)(low << 8) << 32)));
+        if (!IsPlausibleCoordinate(candidate)) return value;
+        repaired = true;
+        return candidate;
     }
 
     private static double Distance(Vertex a, Vertex b)
@@ -1919,6 +2058,8 @@ public sealed partial class AdvToObjConverter
         await using StreamWriter writer = new(stream, new UTF8Encoding(false));
         await writer.WriteLineAsync("# ADV2OBJ mesh");
         await writer.WriteLineAsync("# Source format: Sarine Advisor ADV");
+        if (mesh.UsesCoarseSurface)
+            await writer.WriteLineAsync("# Recovery: stored polygon surface; coarser than the dense scan. Requires visual review.");
         await writer.WriteLineAsync($"g {groupName}");
         foreach (Vertex vertex in mesh.Vertices)
         {
@@ -2182,5 +2323,8 @@ public sealed partial class AdvToObjConverter
         List<Vertex> Vertices,
         List<(int A, int B, int C)> Faces,
         int RepairedVertexCount,
-        List<string> Warnings);
+        List<string> Warnings)
+    {
+        public bool UsesCoarseSurface { get; init; }
+    }
 }

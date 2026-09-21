@@ -98,7 +98,13 @@ public sealed partial class AdvToObjConverter
             {
                 uint parent = (branch - 1) / 2;
                 GroupCut? ancestor = owner.Cuts.FirstOrDefault(item => item.Branch == parent);
-                if (ancestor is null) throw new AdvFormatException($"The parent cut for {cut.Name} is missing from its cutting tree.");
+                if (ancestor is null)
+                {
+                    slice.Warnings.Add(
+                        $"{cut.Name}: cutting-tree branch {parent} is absent; applied the remaining recorded ancestors and requires visual review.");
+                    branch = parent;
+                    continue;
+                }
                 bool lesserSide = (branch & 1) == 0;
                 slice = ClipClosedMesh(slice, ancestor.Plane.Normal,
                     ancestor.Plane.Distance - (lesserSide ? ancestor.Plane.Width : 0), lesserSide);

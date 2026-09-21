@@ -8,6 +8,8 @@ internal static class DecoderChecks
     public static async Task RunAsync()
     {
         CheckTouchingSurfaces();
+        ShiftedMeshChecks.Run();
+        PolygonMeshChecks.Run();
         string temporary = Directory.CreateTempSubdirectory("adv2obj-decoder-").FullName;
         try
         {
@@ -60,6 +62,22 @@ internal static class DecoderChecks
                 "The declared symbol table must exclude unrelated historical records and K symbols.");
             Console.WriteLine("PASS declared Galaxy table overrides unrelated six-symbol records.");
 
+            byte[] reorderedSymbols = [.. source];
+            byte[] galaxySignature = Convert.FromHexString("F36BED43B332FA607EE3551D");
+            int galaxyHeader = reorderedSymbols.AsSpan().IndexOf(galaxySignature);
+            int firstSymbol = galaxyHeader + 32;
+            byte[] declaredSymbols = reorderedSymbols.AsSpan(firstSymbol, 3 * 80).ToArray();
+            foreach ((int destination, int original) in new[] { (0, 1), (1, 2), (2, 0) })
+                declaredSymbols.AsSpan(original * 80, 80).CopyTo(
+                    reorderedSymbols.AsSpan(firstSymbol + destination * 80, 80));
+            string reorderedInput = Path.Combine(temporary, "reordered-symbols.adv");
+            File.WriteAllBytes(reorderedInput, reorderedSymbols);
+            ConversionResult reorderedResult = await converter.ConvertAsync(reorderedInput, output);
+            Require(File.ReadAllLines(Path.Combine(reorderedResult.OutputDirectory,
+                    "reordered-symbols_GalaxySymbols.csv")).SequenceEqual(symbols),
+                "A counted Galaxy table must bind records by code without requiring physical code order.");
+            Console.WriteLine("PASS counted Galaxy symbols can be serialized out of code order.");
+
             string renamed = Path.Combine(temporary, "different-name.adv");
             File.WriteAllBytes(renamed, source);
             ConversionResult renamedResult = await converter.ConvertAsync(renamed, output);
@@ -70,7 +88,8 @@ internal static class DecoderChecks
                 Require(File.ReadAllBytes(file).SequenceEqual(File.ReadAllBytes(other)),
                     "Input filenames must not affect exported geometry or companion data.");
             }
-            Require(File.Exists(input) && File.Exists(renamed) && File.Exists(damagedInput),
+            Require(File.Exists(input) && File.Exists(renamed) && File.Exists(damagedInput)
+                    && File.Exists(reorderedInput),
                 "Decoder checks must not remove source files.");
             Console.WriteLine("PASS identical data under different input filenames produces identical content.");
 

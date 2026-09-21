@@ -7,7 +7,10 @@ public sealed record ConversionResult(
     int VertexCount,
     int FaceCount,
     int RepairedVertexCount,
-    IReadOnlyList<string> Warnings);
+    IReadOnlyList<string> Warnings)
+{
+    public bool UsesCoarseSurface { get; init; }
+}
 
 public sealed record ConversionAndCleanupResult(
     ConversionResult Conversion,
