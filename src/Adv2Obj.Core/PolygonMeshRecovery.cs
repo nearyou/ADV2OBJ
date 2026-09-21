@@ -83,10 +83,10 @@ public sealed partial class AdvToObjConverter
         return null;
     }
 
-    private static PolygonRecord? ReadPolygonRecord(byte[] payload, int start)
+    private static PolygonRecord? ReadPolygonRecord(byte[] payload, int start, int? boundaryEnd = null)
     {
         if (start + 28 > payload.Length) return null;
-        uint length = ReadUInt32(payload, start + 20);
+        uint length = boundaryEnd.HasValue ? checked((uint)(boundaryEnd.Value - start - 24)) : ReadUInt32(payload, start + 20);
         // For this three-valent closed polygon representation: 3V=2E,
         // F=V/2+2, serialized bytes=4+24V+4+4F+8E=38V+16.
         if (length < 16 || (length - 16) % 38 != 0) return null;
@@ -107,7 +107,7 @@ public sealed partial class AdvToObjConverter
             int sides = (int)(ReadUInt32(payload, cursor) & 255);
             if (sides is < 3 or > 64 || cursor + 4L + sides * 4L > end) return null;
             int[] ids = Enumerable.Range(0, sides)
-                .Select(i => (int)(ReadUInt32(payload, cursor + 4 + i * 4) & 65535)).ToArray();
+                .Select(i => (int)(ReadUInt32(payload, cursor + 4 + i * 4) & (boundaryEnd.HasValue && count <= 256 ? 255u : 65535u))).ToArray();
             polygons.Add(ids);
             cursor += 4 + sides * 4;
         }
@@ -210,7 +210,7 @@ public sealed partial class AdvToObjConverter
     }
 
     private static (List<Vertex> Vertices, Mesh Hull, int Supported, int Changed)? RepairPolygonCap(
-        List<Vertex> vertices, List<int[]> polygons, Mesh original, int originalSupport, CancellationToken token)
+        List<Vertex> vertices, List<int[]> polygons, Mesh original, int originalSupport, CancellationToken token, double maximumFraction = .05)
     {
         for (int axis = 0; axis < 3; axis++)
         {
@@ -219,7 +219,7 @@ public sealed partial class AdvToObjConverter
             double span = high - low;
             if (span < 1e-6) continue;
             foreach (var group in vertices.Select((v, i) => (Value: Coordinate(v, axis), Index: i))
-                .GroupBy(v => v.Value).Where(g => g.Count() >= 3 && g.Count() <= vertices.Count * .05))
+                .GroupBy(v => v.Value).Where(g => g.Count() >= 3 && g.Count() <= vertices.Count * maximumFraction))
             {
                 double value = group.Key;
                 if (value >= low - span * .25 && value <= high + span * .25) continue;

@@ -12,6 +12,9 @@ public sealed partial class AdvToObjConverter
             int header = cursor++;
             if (header + 28 > data.Length) continue;
             uint length = ReadUInt32(data, header + 20), count = ReadUInt32(data, header + 24);
+            if (count > 100_000 && (length + 56L) % 56 == 0
+                && ((length + 56L) / 56) == (count & 65535))
+                count &= 65535; // Corroborated below by the independent face count.
             if (count is < 1000 or > 100_000 || length < 8 + count * 24L) continue;
             long faceBytes = length - 8 - count * 24L;
             if (faceBytes % 16 != 0 || faceBytes / 16 < count || faceBytes / 16 > count * 3L) continue;
@@ -64,8 +67,14 @@ public sealed partial class AdvToObjConverter
                 offset += 15;
             }
             if (duplicate || faces.Count < record.Faces * .99 || faces.Count > record.Faces) continue;
+            var sourceFaces = faces.ToList();
+            var sourceVertices = vertices.ToList();
+            for (int attempt = 0; attempt < 2; attempt++)
             try
             {
+                faces = sourceFaces.ToList(); vertices = sourceVertices.ToList();
+                int ears = attempt == 0 ? 0 : RemoveBoundaryEars(faces);
+                if (attempt > 0 && ears == 0) continue;
                 // Gaps can meet at a vertex. Open a small local patch around
                 // those junctions before triangulating its simple boundary.
                 int removed = OpenBoundaryJunctions(faces);
@@ -73,15 +82,40 @@ public sealed partial class AdvToObjConverter
                 var loops = SparseMeshBoundary(faces);
                 if (loops is null) continue;
                 int retained = faces.Count;
+                bool spatialPatch = false;
+                var usedEdges = faces.SelectMany(f => new[] { (f.A, f.B), (f.B, f.C), (f.C, f.A) })
+                    .Select(e => (Math.Min(e.Item1, e.Item2), Math.Max(e.Item1, e.Item2))).ToHashSet();
                 foreach (var loop in loops)
                 {
-                    var cap = TriangulatePlanarBoundary(loop, vertices, out bool complete);
+                    var cap = TriangulatePlanarBoundary(loop, vertices, out bool complete, usedEdges);
+                    if (!complete)
+                    {
+                        cap = TriangulateSpatialGap(loop, vertices, usedEdges, out complete);
+                        spatialPatch = true;
+                    }
                     if (!complete) throw new AdvFormatException("A source triangle gap could not be triangulated.");
                     faces.AddRange(cap);
                 }
-                if (!RestorePatchVertices(vertices, faces, retained)) continue;
-                if (CountInvalidEdges(faces) != 0) continue;
-                if (faces.Count != record.Faces) continue;
+                if (!RestorePatchVertices(vertices, faces, retained)) { System.Diagnostics.Trace.WriteLine("Patch interior vertices could not be restored."); continue; }
+                if (CountInvalidEdges(faces) != 0) { System.Diagnostics.Trace.WriteLine("Patch edges do not close."); continue; }
+                if (faces.Count != record.Faces) { System.Diagnostics.Trace.WriteLine($"Patch face count {faces.Count}, expected {record.Faces}; vertices {vertices.Count}."); continue; }
+                if ((attempt > 0 || spatialPatch) && record.Table != record.Header + 28 + record.Vertices * 24)
+                {
+                    var lengths = sourceFaces.Select(f => Math.Max(Distance(vertices[f.A], vertices[f.B]),
+                        Math.Max(Distance(vertices[f.B], vertices[f.C]), Distance(vertices[f.C], vertices[f.A])))).Order().ToArray();
+                    double scale = Distance(new(vertices.Min(v => v.X), vertices.Min(v => v.Y), vertices.Min(v => v.Z)),
+                        new(vertices.Max(v => v.X), vertices.Max(v => v.Y), vertices.Max(v => v.Z)));
+                    // Plausible doubles alone cannot establish vertex identity:
+                    // a whole-vertex shift can fold an otherwise closed scan.
+                    // Reject a sustained population of edges spanning the stone.
+                    double limit = Math.Max(lengths[lengths.Length / 2] * 10, scale * .1);
+                    if (lengths.Count(v => v > limit) > lengths.Length * .01)
+                    {
+                        Mesh? polygon = TryRecoverStoredPolygon(payload, token);
+                        polygon?.Warnings.Add("The shifted scan coordinates conflict with source triangle adjacency; retained the verified stored polygon surface.");
+                        return polygon;
+                    }
+                }
                 return new(vertices, faces, repaired,
                     [$"Recovered the counted scan: retained {vertices.Count:N0} vertices and {retained:N0} source triangles; "
                     + $"repaired {repaired} coordinates and reconstructed {faces.Count - retained} triangles around incomplete records. Requires visual review."]);
@@ -89,6 +123,17 @@ public sealed partial class AdvToObjConverter
             catch (AdvFormatException error) { System.Diagnostics.Trace.WriteLine(error.Message); }
         }
         return null;
+    }
+
+    private static int RemoveBoundaryEars(List<(int A, int B, int C)> faces)
+    {
+        var edges = faces.SelectMany(f => new[] { (f.A, f.B), (f.B, f.C), (f.C, f.A) })
+            .GroupBy(e => (Math.Min(e.Item1, e.Item2), Math.Max(e.Item1, e.Item2)))
+            .ToDictionary(g => g.Key, g => g.Count());
+        // A missing size word may turn an index value of 3 into a false face.
+        // Retract dangling boundary ears only after ordinary closure fails.
+        return faces.RemoveAll(f => new[] { (f.A, f.B), (f.B, f.C), (f.C, f.A) }
+            .Count(e => edges[(Math.Min(e.Item1, e.Item2), Math.Max(e.Item1, e.Item2))] == 1) >= 2);
     }
 
     private static Mesh? FindIntactPolygonGuide(byte[] payload, int denseHeader, CancellationToken token)

@@ -14,6 +14,7 @@ internal static class PolygonMeshChecks
         byte[] intact = Payload(vertices, polygons);
         object complete = Decode(intact) ?? throw new Exception("Stored polygon pair was not recovered.");
         CheckGeometry(complete, vertices);
+        CheckBoundedRecovery(vertices, polygons);
         Require((bool)complete.GetType().GetProperty("UsesCoarseSurface")!.GetValue(complete)!,
             "Polygon fallback must be identified as a coarse surface.");
 
@@ -62,6 +63,72 @@ internal static class PolygonMeshChecks
     }
 
     private static object? Decode(byte[] payload) => Recover.Invoke(null, [payload, CancellationToken.None]);
+
+    private static void CheckBoundedRecovery(List<Point> vertices, List<int[]> polygons)
+    {
+        var method = typeof(AdvToObjConverter).GetMethod("TryRecoverStoredPolygon", BindingFlags.NonPublic | BindingFlags.Static)!;
+        byte[] Bounded(List<Point> points, List<int[]> references)
+        {
+            byte[] pair = Payload(points, references);
+            int denseHeader = 2 * (24 + 38 * vertices.Count + 16) + 1;
+            const int count = 1024, faces = 2044;
+            byte[] data = new byte[denseHeader + 28 + count * 24 + 4 + faces * 16];
+            pair.AsSpan(0, denseHeader + 20).CopyTo(data);
+            BitConverter.GetBytes(56 * count - 56).CopyTo(data, denseHeader + 20);
+            BitConverter.GetBytes(count).CopyTo(data, denseHeader + 24);
+            BitConverter.GetBytes(faces).CopyTo(data, denseHeader + 28 + count * 24);
+            BitConverter.GetBytes(3).CopyTo(data, denseHeader + 32 + count * 24);
+            // Both polygon headers have damaged lengths; the following typed
+            // records still bound the data and corroborate the vertex counts.
+            BitConverter.GetBytes(int.MaxValue).CopyTo(data, 20);
+            BitConverter.GetBytes(int.MaxValue).CopyTo(data, (denseHeader - 1) / 2 + 20);
+            return data;
+        }
+        object? Read(byte[] data) => method.Invoke(null, [data, CancellationToken.None]);
+        CheckGeometry(Read(Bounded(vertices, polygons)) ?? throw new Exception("Independent polygon bounds were not recovered."), vertices);
+        var damaged = vertices.ToList();
+        foreach (int i in polygons[0]) damaged[i] = damaged[i] with { Z = double.NaN };
+        var badReferences = polygons.Select(p => p.Select(i => i == 0 ? 128 : i).ToArray()).ToList();
+        object repaired = Read(Bounded(damaged, polygons)) ?? throw new Exception("Corroborated polygon coordinates were not recovered.");
+        CheckGeometry(repaired, vertices);
+        CheckGeometry(Read(Bounded(vertices, badReferences)) ?? throw new Exception("Corroborated polygon references were not recovered."), vertices);
+        Require((int)repaired.GetType().GetProperty("RepairedVertexCount")!.GetValue(repaired)! > 0,
+            "Bounded polygon coordinate repairs must be reported.");
+        var invalid = polygons.Select(p => p.Select(_ => 0).ToArray()).ToList();
+        Require(Read(Bounded(vertices, invalid)) is null, "Unverifiable polygon planes must not be accepted.");
+        byte[] bounded = Bounded(vertices, polygons);
+        var exclude = typeof(AdvToObjConverter).GetMethod("ExcludeUnknownPolygonData", BindingFlags.Static | BindingFlags.NonPublic)!;
+        bool[] unknown = new bool[bounded.Length];
+        unknown[28 + 10 * 24] = true;
+        Require((bool)exclude.Invoke(null, [bounded, unknown])! && double.IsNaN(BitConverter.ToDouble(bounded, 28 + 10 * 24)),
+            "Dictionary-dependent coordinates must be marked unknown even when decoded bytes look plausible.");
+        CheckGeometry(Read(bounded) ?? throw new Exception("Known polygon planes could not repair an excluded coordinate."), vertices);
+        unknown[0] = true;
+        Require(!(bool)exclude.Invoke(null, [bounded, unknown])!, "A dictionary-dependent type signature must be rejected.");
+
+        bounded = Bounded(vertices, polygons);
+        using var compressed = new MemoryStream();
+        compressed.WriteByte(6); // Invalid initial block, followed by a valid block.
+        using (var deflater = new System.IO.Compression.DeflateStream(compressed, System.IO.Compression.CompressionLevel.Optimal, true))
+            deflater.Write(bounded);
+        byte[] zip = compressed.ToArray();
+        byte[] container = new byte[96 + zip.Length];
+        BitConverter.GetBytes(64).CopyTo(container, 52);
+        BitConverter.GetBytes((ushort)8).CopyTo(container, 64);
+        BitConverter.GetBytes(zip.Length).CopyTo(container, 74);
+        BitConverter.GetBytes(bounded.Length).CopyTo(container, 78);
+        BitConverter.GetBytes((ushort)10).CopyTo(container, 82);
+        System.Text.Encoding.ASCII.GetBytes("ZippedData").CopyTo(container, 86);
+        // ZippedData is ten bytes; the payload follows at offset 96.
+        zip.CopyTo(container, 96);
+        var restart = typeof(AdvToObjConverter).GetMethod("RecoverCompressedStoredSurface", BindingFlags.Static | BindingFlags.NonPublic)!;
+        object?[] restartArgs = [container, 64, CancellationToken.None];
+        object recoveredBlock = restart.Invoke(null, restartArgs) ?? throw new Exception("A verified polygon surface after a broken DEFLATE block was not recovered.");
+        CheckGeometry(recoveredBlock, vertices);
+        Require((bool)recoveredBlock.GetType().GetProperty("UsesCoarseSurface")!.GetValue(recoveredBlock)!,
+            "Restarted compressed geometry must retain its coarse-review marker.");
+        Console.WriteLine("PASS independently bounded polygon records: coordinate/reference repairs, exact source geometry, and rejection of unsupported planes.");
+    }
 
     private static void CheckGeometry(object mesh, List<Point> expected)
     {

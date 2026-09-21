@@ -18,6 +18,13 @@ public sealed partial class AdvToObjConverter
         [0xF3, 0x6B, 0xED, 0x43, 0xB3, 0x32, 0xFA, 0x60, 0x7E, 0xE3, 0x55, 0x1D];
     private const int GalaxySearchWindow = 8_000_000;
 
+    private static int GalaxySearchStart(byte[] source)
+    {
+        int tail = Math.Max(0, source.Length - GalaxySearchWindow);
+        int table = FindBytes(source, GalaxyTableSignature, 0, source.Length);
+        return table < 0 ? tail : Math.Min(tail, table);
+    }
+
     // Sparse bit masks observed in the supplied Advisor data. XOR removes the
     // mask while retaining the original triangle index.
     private static readonly uint[] AdvisorMasks =
@@ -84,6 +91,8 @@ public sealed partial class AdvToObjConverter
         catch (AdvFormatException primaryError)
         {
             recoveredFromInflate = FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                ?? RecoverStoredRawSurface(source, ref roughRecordEnd, cancellationToken)
+                ?? RecoverCompressedStoredSurface(source, ref roughRecordEnd, cancellationToken)
                 ?? throw new AdvFormatException(
                     $"{primaryError.Message} No complete alternate mesh was found.");
             recoveredFromInflate.Warnings.Add(
@@ -102,6 +111,14 @@ public sealed partial class AdvToObjConverter
         {
             Mesh? radialRecovery = TryRecoverDeclaredMesh(payload, cancellationToken)
                 ?? TryRecoverPointSurface(payload, cancellationToken);
+            // A damaged count invalidates the generic repair routine's inferred
+            // coordinate boundary. Prefer a separately validated stored surface.
+            if (radialRecovery is null && DeclaredScans(payload).Any(record =>
+                ReadUInt32(payload, record.Header + 24) != record.Vertices))
+                radialRecovery = TryRecoverSegmentedMesh(payload, cancellationToken)
+                    ?? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
+                    ?? RecoverPolygonMesh(payload, cancellationToken, allowScanRefinement)
+                    ?? TryRecoverStoredPolygon(payload, cancellationToken);
             Mesh? completeAlternate = radialRecovery ?? (CountFaceRecords(payload) < 100
                 ? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
                 : null);
@@ -115,7 +132,7 @@ public sealed partial class AdvToObjConverter
             {
                 try
                 {
-                    mesh = RepairDamagedMesh(payload);
+                    mesh = RepairDamagedMesh(payload, cancellationToken);
                 }
                 catch (AdvFormatException primaryError)
                 {
@@ -123,6 +140,7 @@ public sealed partial class AdvToObjConverter
                         ?? TryRecoverDeclaredMesh(payload, cancellationToken, allowShifted: true)
                         ?? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
                         ?? RecoverPolygonMesh(payload, cancellationToken, allowScanRefinement)
+                        ?? TryRecoverStoredPolygon(payload, cancellationToken)
                         ?? throw new AdvFormatException(
                             $"{primaryError.Message} No complete alternate mesh was found.");
                     mesh.Warnings.Add(
@@ -907,7 +925,7 @@ public sealed partial class AdvToObjConverter
     {
         string[] labels = ["X", "T", "V", "(X)", "(T)", "(V)", "K"];
         List<GalaxyCandidate> candidates = [];
-        int start = Math.Max(0, source.Length - GalaxySearchWindow);
+        int start = GalaxySearchStart(source);
         for (int offset = start; offset <= source.Length - 64; offset++)
         {
             uint code = ReadUInt32(source, offset);
@@ -915,11 +933,17 @@ public sealed partial class AdvToObjConverter
             uint variant = ReadUInt32(source, offset + 8);
             uint reserved = ReadUInt32(source, offset + 12);
             if (code > 20 || ordinal >= labels.Length) continue;
+            if (variant == 1 && RecoverShortSymbolHeader(source, offset) is { } shiftedPosition)
+            {
+                candidates.Add(new GalaxyCandidate(offset, (int)code, (int)ordinal, shiftedPosition, true));
+                continue;
+            }
 
             int coordinateOffset;
             bool repaired = false;
             if ((variant == 0 && reserved == 0)
-                || (variant == 1 && reserved <= 1))
+                || (variant == 1 && (reserved <= 1 || reserved == 2
+                    && source.AsSpan(offset + 16, 24).SequenceEqual(source.AsSpan(offset + 40, 24)))))
             {
                 coordinateOffset = offset + 16;
             }
@@ -932,7 +956,7 @@ public sealed partial class AdvToObjConverter
                 coordinateOffset = offset + 14;
                 repaired = true;
             }
-            else if (variant == 2 && reserved == 1)
+            else if ((variant == 2 || variant == 0 && source.AsSpan(offset + 16, 24).IndexOfAnyExcept((byte)0) < 0) && reserved == 1)
             {
                 coordinateOffset = offset + 40;
             }
@@ -945,7 +969,13 @@ public sealed partial class AdvToObjConverter
                 ReadDouble(source, coordinateOffset),
                 ReadDouble(source, coordinateOffset + 8),
                 ReadDouble(source, coordinateOffset + 16));
-            if (!IsGalaxyPosition(position)) continue;
+            if (!IsGalaxyPosition(position))
+            {
+                Vertex? restored = variant == 1 ? RecoverDuplicatedSymbolPosition(source, offset) : null;
+                if (restored is null) continue;
+                position = restored.Value;
+                repaired = true;
+            }
             candidates.Add(new GalaxyCandidate(offset, (int)code, (int)ordinal, position, repaired));
         }
 
@@ -1021,7 +1051,7 @@ public sealed partial class AdvToObjConverter
     private static List<GalaxyCandidate>? FindGuidGalaxyTable(
         byte[] source, List<GalaxyCandidate> candidates)
     {
-        int search = Math.Max(0, source.Length - GalaxySearchWindow);
+        int search = GalaxySearchStart(source);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
@@ -1051,7 +1081,8 @@ public sealed partial class AdvToObjConverter
                 .Where(candidate => candidate.Code == code
                     && candidate.Offset >= firstOffset
                     && candidate.Offset <= firstOffset + 500_000
-                    && ReadUInt32(source, candidate.Offset + 8) is 1 or 2)
+                    && (ReadUInt32(source, candidate.Offset + 8) is 1 or 2
+                        || ReadUInt32(source, candidate.Offset + 8) == 0 && ReadUInt32(source, candidate.Offset + 12) == 1))
                 .GroupBy(candidate => candidate.Ordinal)
                 .Select(group => group.OrderBy(candidate => candidate.Offset).First())
                 .ToList())
@@ -1089,7 +1120,7 @@ public sealed partial class AdvToObjConverter
 
     private static List<GalaxyCandidate>? FindShiftedVariant2GalaxyTable(byte[] source)
     {
-        int search = Math.Max(0, source.Length - GalaxySearchWindow);
+        int search = GalaxySearchStart(source);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
@@ -1155,103 +1186,110 @@ public sealed partial class AdvToObjConverter
     private static List<GalaxyCandidate>? FindGalaxyTableWithInactiveSlot(
         byte[] source, List<GalaxyCandidate> candidates)
     {
-        int search = Math.Max(0, source.Length - GalaxySearchWindow);
+        int search = GalaxySearchStart(source);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
             search++;
-            if (header > source.Length - 32) continue;
-            uint count = ReadUInt32(source, header + 28);
-            if (count is < 4 or > 7) continue;
-            int first = header + 32;
-            int inactiveCode = -1;
-            int inactiveOffset = -1;
-            for (int offset = first; offset <= Math.Min(source.Length - 80, first + 500_000); offset++)
+            foreach (int countOffset in new[] { 28, 32 })
             {
-                uint code = ReadUInt32(source, offset);
-                if (code >= count || ReadUInt32(source, offset + 8) != 2
-                    || ReadUInt32(source, offset + 12) != 3
-                    || !source.AsSpan(offset + 16, 48).SequenceEqual(new byte[48])) continue;
-                inactiveCode = (int)code;
-                inactiveOffset = offset;
-                break;
-            }
-            if (inactiveCode < 0 || inactiveOffset != first && inactiveOffset > first + count * 80)
-                continue;
-
-            List<GalaxyCandidate> table = [];
-            for (int code = 0; code < count; code++)
-            {
-                if (code == inactiveCode) continue;
-                GalaxyCandidate? entry = candidates.FirstOrDefault(candidate =>
-                    candidate.Code == code && candidate.Offset >= first
-                    && candidate.Offset <= first + 500_000
-                    && ReadUInt32(source, candidate.Offset + 8) is 1 or 2);
-                if (entry is null && inactiveOffset > first)
+                if (header > source.Length - countOffset - 4) continue;
+                uint count = ReadUInt32(source, header + countOffset);
+                if (count is < 4 or > 7) continue;
+                int first = header + countOffset + 4;
+                int inactiveCode = -1;
+                int inactiveOffset = -1;
+                for (int offset = first; offset <= Math.Min(source.Length - 80, first + 500_000); offset++)
                 {
-                    // Variant-2 records occupy fixed 80-byte slots. Their
-                    // last coordinate may have lost its low two bytes.
-                    int offset = first + code * 80;
-                    if (offset <= source.Length - 64
-                        && ReadUInt32(source, offset) == code
-                        && ReadUInt32(source, offset + 8) == 2
-                        && ReadUInt32(source, offset + 12) == 1)
-                    {
-                        double[] values = new double[3];
-                        bool repaired = false;
-                        for (int axis = 0; axis < 3; axis++)
-                        {
-                            int coordinate = offset + 40 + axis * 8;
-                            double value = ReadDouble(source, coordinate);
-                            if (!IsSymbolCoordinate(value))
-                            {
-                                value = BitConverter.Int64BitsToDouble(
-                                    unchecked((long)(ReadUInt64(source, coordinate) << 16)));
-                                repaired = true;
-                            }
-                            values[axis] = value;
-                        }
-                        Vertex position = new(values[0], values[1], values[2]);
-                        if (IsGalaxyPosition(position))
-                            entry = new GalaxyCandidate(offset, code, (int)ReadUInt32(source, offset + 4),
-                                position, repaired);
-                    }
-                }
-                if (entry is null)
-                {
-                    table.Clear();
+                    uint code = ReadUInt32(source, offset);
+                    if (code >= count || ReadUInt32(source, offset + 8) != 2
+                        || ReadUInt32(source, offset + 12) is not (3 or 4)
+                        || !source.AsSpan(offset + 16, 48).SequenceEqual(new byte[48])) continue;
+                    inactiveCode = (int)code;
+                    inactiveOffset = offset;
                     break;
                 }
-                table.Add(entry);
+                if (inactiveCode < 0 || inactiveOffset != first && inactiveOffset > first + count * 80)
+                    continue;
+
+                List<GalaxyCandidate> table = [];
+                for (int code = 0; code < count; code++)
+                {
+                    if (code == inactiveCode) continue;
+                    GalaxyCandidate? entry = candidates.FirstOrDefault(candidate =>
+                        candidate.Code == code && candidate.Offset >= first
+                        && candidate.Offset <= first + 500_000
+                        && ReadUInt32(source, candidate.Offset + 8) is 1 or 2);
+                    if (entry is null && inactiveOffset > first)
+                    {
+                        // Variant-2 records occupy fixed 80-byte slots. Their
+                        // last coordinate may have lost its low two bytes.
+                        int offset = first + code * 80;
+                        if (offset <= source.Length - 64
+                            && ReadUInt32(source, offset) == code
+                            && ReadUInt32(source, offset + 8) == 2
+                            && ReadUInt32(source, offset + 12) == 1)
+                        {
+                            double[] values = new double[3];
+                            bool repaired = false;
+                            for (int axis = 0; axis < 3; axis++)
+                            {
+                                int coordinate = offset + 40 + axis * 8;
+                                double value = ReadDouble(source, coordinate);
+                                if (!IsSymbolCoordinate(value))
+                                {
+                                    value = BitConverter.Int64BitsToDouble(
+                                        unchecked((long)(ReadUInt64(source, coordinate) << 16)));
+                                    repaired = true;
+                                }
+                                values[axis] = value;
+                            }
+                            Vertex position = new(values[0], values[1], values[2]);
+                            if (IsGalaxyPosition(position))
+                                entry = new GalaxyCandidate(offset, code, (int)ReadUInt32(source, offset + 4),
+                                    position, repaired);
+                        }
+                    }
+                    if (entry is null)
+                    {
+                        table.Clear();
+                        break;
+                    }
+                    table.Add(entry);
+                }
+                if (table.Count == count - 1
+                    && table.Select(item => item.Code).Distinct().Count() == count - 1
+                    && table.Select(item => item.Ordinal).Distinct().Count() == count - 1)
+                    return table;
             }
-            if (table.Count == count - 1
-                && table.Select(item => item.Code).Distinct().Count() == count - 1
-                && table.Select(item => item.Ordinal).Distinct().Count() == count - 1)
-                return table;
         }
         return null;
     }
 
     private static bool HasInactiveGalaxySlot(byte[] source)
     {
-        int search = Math.Max(0, source.Length - GalaxySearchWindow);
+        int search = GalaxySearchStart(source);
         while ((search = FindBytes(source, GalaxyTableSignature, search, source.Length)) >= 0)
         {
             int header = search;
             search++;
-            if (header > source.Length - 32 || ReadUInt32(source, header + 28) != 6) continue;
-            int first = header + 32;
-            for (int index = 0; index < 6 && first + index * 80 <= source.Length - 64; index++)
+            foreach (int countOffset in new[] { 28, 32 })
             {
-                int offset = first + index * 80;
-                if (ReadUInt32(source, offset + 8) == 2
-                    && ReadUInt32(source, offset + 12) == 3
-                    && source.AsSpan(offset + 16, 48).SequenceEqual(new byte[48]))
-                    return true;
+                if (header > source.Length - countOffset - 4 || ReadUInt32(source, header + countOffset) != 6) continue;
+                int first = header + countOffset + 4;
+                for (int index = 0; index < 6 && first + index * 80 <= source.Length - 64; index++)
+                {
+                    int offset = first + index * 80;
+                    if (ReadUInt32(source, offset + 8) == 2
+                        && ReadUInt32(source, offset + 12) is 3 or 4
+                        && source.AsSpan(offset + 16, 48).SequenceEqual(new byte[48]))
+                        return true;
+                }
             }
         }
         return false;
     }
+
 
     private static List<GalaxyCandidate>? SelectGalaxySequence(
         List<GalaxyCandidate> candidates,
@@ -1354,7 +1392,7 @@ public sealed partial class AdvToObjConverter
         return new Mesh(vertices, faces, repaired, warnings);
     }
 
-    private static Mesh RepairDamagedMesh(byte[] payload)
+    private static Mesh RepairDamagedMesh(byte[] payload, CancellationToken cancellationToken)
     {
         int encodedFaceCount = CountFaceRecords(payload);
         int faceStart;
@@ -1408,6 +1446,10 @@ public sealed partial class AdvToObjConverter
             ? inferredVertexCount
             : checked((int)plausibleIndices.Max() + 1);
         int vertexStart = checked(faceStart - vertexCount * 24);
+        var declared = DeclaredScans(payload).ToList();
+        if (declared.Count > 0 && !declared.Any(record => record.Header + 28 == vertexStart
+            && record.Vertices == vertexCount))
+            throw new AdvFormatException("The repair vertex boundary conflicts with the counted scan; byte alignment recovery is required.");
         if (vertexStart < 0)
         {
             throw new AdvFormatException("The recoverable rough-mesh vertex table is incomplete.");
@@ -1476,12 +1518,16 @@ public sealed partial class AdvToObjConverter
             throw new AdvFormatException("The rough mesh is too damaged to reconstruct.");
         }
 
+        var repairTime = System.Diagnostics.Stopwatch.StartNew();
         MeshAutoRepair repair = new(repairMesh)
         {
             RepairTolerance = Math.Max(0.001, medianEdge * 0.01),
             MinEdgeLengthTol = Math.Max(0.0001, medianEdge * 0.001),
+            Progress = new ProgressCancel(() => cancellationToken.IsCancellationRequested || repairTime.Elapsed > TimeSpan.FromSeconds(10)),
         };
-        if (!repair.Apply() || !repairMesh.CachedIsClosed)
+        bool repairedSuccessfully = repair.Apply();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!repairedSuccessfully || !repairMesh.CachedIsClosed)
         {
             throw new AdvFormatException("The rough-mesh topology could not be closed safely.");
         }

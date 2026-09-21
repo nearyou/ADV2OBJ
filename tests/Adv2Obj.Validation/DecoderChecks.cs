@@ -62,10 +62,58 @@ internal static class DecoderChecks
                 "The declared symbol table must exclude unrelated historical records and K symbols.");
             Console.WriteLine("PASS declared Galaxy table overrides unrelated six-symbol records.");
 
+            string distantInput = Path.Combine(temporary, "distant-symbols.adv");
+            File.WriteAllBytes(distantInput, [.. source, .. new byte[9 * 1024 * 1024]]);
+            var distantResult = await converter.ConvertAsync(distantInput, output);
+            Require(File.ReadAllLines(Path.Combine(distantResult.OutputDirectory, "distant-symbols_GalaxySymbols.csv"))
+                .SequenceEqual(symbols), "A typed Galaxy table outside the tail window must retain its exact labels and coordinates.");
+            Console.WriteLine("PASS Galaxy table more than eight megabytes from the container end.");
+
             byte[] reorderedSymbols = [.. source];
             byte[] galaxySignature = Convert.FromHexString("F36BED43B332FA607EE3551D");
             int galaxyHeader = reorderedSymbols.AsSpan().IndexOf(galaxySignature);
             int firstSymbol = galaxyHeader + 32;
+            foreach (string layout in new[] { "mode-two", "single-copy", "short-header", "short-copy" })
+            {
+                byte[] variant = source.ToArray();
+                if (layout != "single-copy")
+                {
+                    BitConverter.GetBytes(1).CopyTo(variant, firstSymbol + 8);
+                    BitConverter.GetBytes(0).CopyTo(variant, firstSymbol + 12);
+                    Array.Copy(variant, firstSymbol + 40, variant, firstSymbol + 16, 24);
+                }
+                if (layout == "mode-two") BitConverter.GetBytes(2).CopyTo(variant, firstSymbol + 12);
+                if (layout == "single-copy")
+                {
+                    BitConverter.GetBytes(0).CopyTo(variant, firstSymbol + 8);
+                    BitConverter.GetBytes(1).CopyTo(variant, firstSymbol + 12);
+                    Array.Clear(variant, firstSymbol + 16, 24);
+                }
+                if (layout is "short-header" or "short-copy")
+                {
+                    var bytes = variant.ToList();
+                    bytes.RemoveRange(firstSymbol + (layout == "short-header" ? 12 : 18), layout == "short-header" ? 3 : 2);
+                    variant = bytes.ToArray();
+                }
+                string variantInput = Path.Combine(temporary, layout + ".adv");
+                File.WriteAllBytes(variantInput, variant);
+                var converted = await converter.ConvertAsync(variantInput, output);
+                Require(File.ReadAllLines(Path.Combine(converted.OutputDirectory, layout + "_GalaxySymbols.csv")).SequenceEqual(symbols),
+                    $"Symbol layout {layout} did not retain the exact stored coordinates and labels.");
+            }
+            byte[] inactive = new byte[80];
+            BitConverter.GetBytes(3).CopyTo(inactive, 0); BitConverter.GetBytes(4).CopyTo(inactive, 4);
+            BitConverter.GetBytes(2).CopyTo(inactive, 8); BitConverter.GetBytes(4).CopyTo(inactive, 12);
+            var inactiveData = source.ToList();
+            inactiveData.InsertRange(firstSymbol, inactive);
+            for (int i = 0; i < 4; i++) inactiveData[galaxyHeader + 28 + i] = BitConverter.GetBytes(4)[i];
+            inactiveData.InsertRange(galaxyHeader + 28, new byte[4]);
+            string inactiveInput = Path.Combine(temporary, "inactive-mode-four.adv");
+            File.WriteAllBytes(inactiveInput, inactiveData.ToArray());
+            var inactiveResult = await converter.ConvertAsync(inactiveInput, output);
+            Require(File.ReadAllLines(Path.Combine(inactiveResult.OutputDirectory, "inactive-mode-four_GalaxySymbols.csv")).SequenceEqual(symbols),
+                "An explicitly empty mode-four slot must not invent a coordinate or lose active symbols.");
+            Console.WriteLine("PASS symbol modes, shortened headers/copies, and extended inactive table: exact coordinates preserved.");
             byte[] declaredSymbols = reorderedSymbols.AsSpan(firstSymbol, 3 * 80).ToArray();
             foreach ((int destination, int original) in new[] { (0, 1), (1, 2), (2, 0) })
                 declaredSymbols.AsSpan(original * 80, 80).CopyTo(

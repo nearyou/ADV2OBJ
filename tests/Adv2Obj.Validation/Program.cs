@@ -1,10 +1,30 @@
 using Adv2Obj.Core;
 
+
+if (args is ["--record-diagnostic", string diagnosticFile])
+{
+    var source = File.ReadAllBytes(diagnosticFile);
+    object? Invoke(string name, params object?[] values) => typeof(AdvToObjConverter)
+        .GetMethod(name, System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.Invoke(null, values);
+    Console.WriteLine("Payload");
+    var record = ((byte[] Payload, int End, bool Alternate))Invoke("DecompressRoughPayload", source)!;
+    Console.WriteLine("Cuts");
+    var cuts = Invoke("DecodeActiveCutPlanes", source, record.End, false);
+    Console.WriteLine("Groups");
+    Invoke("DecodeCutGroups", source, cuts, false);
+    Console.WriteLine("Symbols");
+    Console.WriteLine(Invoke("DecodeGalaxySymbols", source));
+    return;
+}
+
+if (Environment.GetEnvironmentVariable("ADV2OBJ_TRACE") == "1")
+    System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
+
 if (args is ["--recovery-diagnostic", string payloadFile])
 {
     System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
     byte[] payload = File.ReadAllBytes(payloadFile);
-    foreach (string name in new[] { "DecodeMesh", "TryRecoverDeclaredMesh", "TryRecoverSegmentedMesh", "TryRecoverPolygonMesh" })
+    foreach (string name in new[] { "DecodeMesh", "TryRecoverDeclaredMesh", "TryRecoverStoredPolygon", "TryRecoverSegmentedMesh", "TryRecoverPolygonMesh" })
     {
         Console.WriteLine(name);
         try
@@ -154,6 +174,7 @@ if (args is ["--probe", string probeInput, string probeOutput])
     int failures = 0;
     foreach (string advFile in Directory.EnumerateFiles(probeInput, "*.adv").Order())
     {
+        Console.Error.WriteLine($"BEGIN {Path.GetFileName(advFile)}");
         try
         {
             ConversionResult result = await probeConverter.ConvertAsync(advFile, probeOutput);

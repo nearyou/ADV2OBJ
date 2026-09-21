@@ -135,6 +135,18 @@ internal static class ShiftedMeshChecks
         Array.Copy(conflicting, faceStart, conflicting, faceStart + 16, 16);
         Require(method.Invoke(null, [conflicting, CancellationToken.None, false]) is null,
             "Counted recovery accepted conflicting duplicate connectivity.");
+        var spatial = typeof(AdvToObjConverter).GetMethod("TriangulateSpatialGap", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var occupied = new HashSet<(int, int)> { (0, 700) };
+        object?[] arguments = [new List<int> { 0, 500, 700, 900 }, result.GetType().GetProperty("Vertices")!.GetValue(result), occupied, false];
+        var patch = (List<(int A, int B, int C)>)spatial.Invoke(null, arguments)!;
+        Require((bool)arguments[3]! && patch.Count == 2, "A small spatial gap was not triangulated.");
+        var patchEdges = patch.SelectMany(f => new[] { (f.A, f.B), (f.B, f.C), (f.C, f.A) })
+            .Select(e => (Math.Min(e.Item1, e.Item2), Math.Max(e.Item1, e.Item2))).ToList();
+        Require(!patchEdges.Contains((0, 700)) && patchEdges.Count(e => e == (500, 900)) == 2,
+            "Gap recovery reused an occupied diagonal instead of the available connection.");
+        occupied.Add((500, 900));
+        Require(((List<(int, int, int)>)spatial.Invoke(null, arguments)!).Count == 0 && !(bool)arguments[3]!,
+            "A gap with no unoccupied diagonal must be rejected.");
         Console.WriteLine("PASS counted triangle gaps: every coordinate retained, touching gaps closed, declared counts restored, conflicting connectivity rejected.");
     }
 

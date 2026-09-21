@@ -2,7 +2,8 @@ namespace Adv2Obj.Core;
 
 public sealed partial class AdvToObjConverter
 {
-    private static List<(int A, int B, int C)> TriangulatePlanarBoundary(List<int> boundary, List<Vertex> vertices, out bool complete)
+    private static List<(int A, int B, int C)> TriangulatePlanarBoundary(List<int> boundary, List<Vertex> vertices, out bool complete,
+        HashSet<(int, int)>? forbiddenDiagonals = null)
     {
         complete = false;
         List<(int A, int B, int C)> result = [];
@@ -59,7 +60,8 @@ public sealed partial class AdvToObjConverter
         while (remaining > 3)
         {
             int a = previous[current], c = next[current];
-            if (Turn(a, current, c) > 1e-10 && !ContainsPoint(a, current, c))
+            if (Turn(a, current, c) > 1e-10 && !ContainsPoint(a, current, c)
+                && (forbiddenDiagonals is null || !forbiddenDiagonals.Contains((Math.Min(ids[a], ids[c]), Math.Max(ids[a], ids[c])))))
             {
                 result.Add((ids[a], ids[current], ids[c]));
                 active[current] = false;

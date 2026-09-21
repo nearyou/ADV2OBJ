@@ -4,7 +4,7 @@ public sealed partial class AdvToObjConverter
 {
     private static List<GalaxyCandidate>? FindOrdinalGalaxyTable(byte[] source, List<GalaxyCandidate> candidates)
     {
-        int cursor = Math.Max(0, source.Length - GalaxySearchWindow);
+        int cursor = GalaxySearchStart(source);
         while ((cursor = FindBytes(source, GalaxyTableSignature, cursor, source.Length)) >= 0)
         {
             int header = cursor++;

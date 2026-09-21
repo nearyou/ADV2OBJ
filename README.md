@@ -266,3 +266,69 @@ triangles, non-spherical topology, distant root cuts, incomplete root ancestry,
 and duplicate-code symbol tables. These recoveries use input records, never sample
 filenames, hashes, or reference-output substitutions. Review warnings remain
 necessary; conversion success does not prove exact Advisor equivalence.
+
+## September 22 stopped-file batch
+
+The 14 inputs in `Downloads/stopped file` now produce 123 OBJ files and 14
+CSV/INI pairs. All 123 meshes pass finite-coordinate, index, closed-edge and
+surface checks. The 30-file preceding batch, seven earlier inputs, and six
+original samples retain byte-identical outputs (307 files). The single-file
+Windows build is `Release/2026-09-22-stopped/ADV2OBJ.exe`.
+
+Galaxy tables are located by their typed record signature even when more than
+eight megabytes precede the end of the container. Small triangle-table gaps can
+be repaired without reusing occupied diagonals; a fallback removes dangling
+false-marker triangles and triangulates bounded nonplanar gaps. Declared counts
+and closed connectivity must still agree.
+
+When the dense scan cannot be recovered reliably, adjacent typed records can
+independently bound a stored polygon surface despite damaged length words.
+Coordinate repairs require corroborating incident planes; a repeated corrupt
+polygon index is repaired only when at least three incident polygons uniquely
+identify the same stored replacement vertex. Surface-point retention and source
+plane validation remain required. New shifted-gap recoveries that produce a
+sustained population of implausibly long edges use the verified polygon surface
+instead of exporting folded scan geometry.
+
+Five inputs in this batch use this explicitly marked coarse recovery:
+`1429.28-1772`, `1429.28-1853`, `1429.28-1862`, `1429.28-1922`, and
+`1429.28-1954`. Their outputs are approximations requiring MeshLab review, not
+verified exact Advisor exports. Two other inputs retain their scan coordinates
+with five missing triangles reconstructed each. Existing cut-plan review
+warnings remain, including the unavailable ancestor branch in `601-72`.
+No filename/hash matching or sample-output substitution is used in production.
+All 14 source files were retained during validation.
+
+## September 22 replacement New folder batch
+
+The replacement `Downloads/New folder` contains 28 inputs. All 28 convert to
+122 OBJ files, 28 CSV files, and 28 INI files. All 122 meshes pass finite-value,
+index, closed-edge, and surface checks. Regression conversion of the previous
+30-file batch, 14 stopped files, seven earlier inputs, and six original samples
+preserves all 458 output files byte for byte. The single-file Windows build is
+`Release/2026-09-22-batch28/ADV2OBJ.exe`. Validation retained all source inputs.
+
+Symbol decoding now handles additional stored mode values, shortened reserved
+headers, and short first coordinate copies. Recovery uses the complete duplicate
+coordinate block only when the surviving first-copy bytes agree. Explicit empty
+symbol slots support both count locations and the additional inactive mode.
+Unknown slots are not populated with invented coordinates.
+
+Generic topology repair rejects coordinate boundaries that conflict with a typed
+scan record before running geometry repair. A cancellation callback also allows
+cooperative repair cancellation. Stored polygon recovery can use independently
+bounded surfaces when dense counts are absent or large, and repair a reflected
+cap only when source-plane agreement and surface-point retention validate it.
+
+For a broken compressed stream, a bounded search can restart at a later dynamic
+DEFLATE block. Two synthetic dictionary histories identify every output byte
+that depends on unavailable history. Such coordinate bytes are marked unknown
+before incident-plane recovery; dependent type signatures and count bytes are
+rejected. Only the validated coarse polygon surface is exported from this path.
+
+Five inputs use coarse recovery: `1429.28-1204`, `1429.28-2242`,
+`1429.28-2313`, `1429.28-2683`, and `1429.28-318`. These require MeshLab review
+and are not verified exact Advisor exports. Existing cut-history, alternate-mesh,
+coordinate-repair, and approximate-cap warnings remain visible. Synthetic tests
+cover the new symbol layouts, exact copied coordinates, inactive slots, restart
+after a broken compressed block, and exclusion of dictionary-dependent data.
