@@ -59,6 +59,7 @@ internal static class ShiftedMeshChecks
         }
         var recoveredFaces = ((IEnumerable)mesh.GetType().GetProperty("Faces")!.GetValue(mesh)!).Cast<object>().Count();
         Require(recoveredFaces == faces.Count, "Shifted recovery did not restore a closed surface.");
+        CheckRecoveredSpikeDetection(mesh);
         CheckScanRefinement(stream.ToArray(), payload.ToArray(), vertices, faces, damagedVertex);
         byte[] inconsistent = payload.ToArray();
         int conflictingFace = 40 + vertices.Count * 24 + 4 + 100 * 16 - 8;
@@ -71,6 +72,32 @@ internal static class ShiftedMeshChecks
         try { recovery.Invoke(null, [payload.ToArray(), cancelled.Token]); throw new Exception("Recovery ignored cancellation."); }
         catch (TargetInvocationException error) when (error.InnerException is OperationCanceledException) { }
         Console.WriteLine("PASS shifted vertex/face records: original vertex numbering and intact coordinates preserved; small hole closed; conflicting topology rejected; cancellation honored.");
+    }
+
+    private static void CheckRecoveredSpikeDetection(object mesh)
+    {
+        var check = typeof(AdvToObjConverter).GetMethod("HasSustainedScanSpikes", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var meshType = mesh.GetType();
+        var source = (IList)meshType.GetProperty("Vertices")!.GetValue(mesh)!;
+        object Make(double scale, bool corrupt)
+        {
+            var points = (IList)Activator.CreateInstance(source.GetType())!;
+            for (int i = 0; i < source.Count; i++)
+            {
+                object v = source[i]!;
+                double Axis(string axis) => (double)v.GetType().GetProperty(axis)!.GetValue(v)!;
+                double x = Axis("X") * scale, y = Axis("Y") * scale, z = Axis("Z") * scale;
+                if (corrupt && i % 64 == 0) { x += 20000 * scale; z -= 15000 * scale; }
+                points.Add(Activator.CreateInstance(v.GetType(), x, y, z));
+            }
+            return Activator.CreateInstance(meshType, points, meshType.GetProperty("Faces")!.GetValue(mesh), 0, new List<string>())!;
+        }
+        foreach (double scale in new[] { .001, 1.0, 100.0 })
+        {
+            Require(!(bool)check.Invoke(null, [Make(scale, false)])!, "Valid dense geometry must pass at any unit scale.");
+            Require((bool)check.Invoke(null, [Make(scale, true)])!, "Watertight connectivity must not conceal displaced-coordinate spikes.");
+        }
+        Console.WriteLine("PASS recovered scan geometry: displaced-coordinate spikes detected independently of units and topology.");
     }
 
     private static void Require(bool value, string message)
@@ -162,6 +189,25 @@ internal static class ShiftedMeshChecks
         var constructor = meshType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
             .Single(c => c.GetParameters().Length == 4);
         object guide = constructor.Invoke([vertices, faces, 0, new List<string>()]);
+        var independent = converter.GetMethod("RecoverIndependentScan", BindingFlags.NonPublic | BindingFlags.Static)!;
+        byte[] typed = intact.ToArray();
+        Convert.FromHexString("95F2B28927963B48A7A200CBA02F27AB").CopyTo(typed, 12);
+        bool[] unknown = new bool[typed.Length];
+        object scan = independent.Invoke(null, [typed, unknown, guide, CancellationToken.None])
+            ?? throw new Exception("A completely independent source scan was not preserved.");
+        var preserved = ((IEnumerable)meshType.GetProperty("Vertices")!.GetValue(scan)!).Cast<object>().ToArray();
+        Require(preserved.Length == expected.Count && preserved.SequenceEqual(vertices.Cast<object>()),
+            "Independent scan recovery changed a measured coordinate.");
+        Require(((IEnumerable)meshType.GetProperty("Faces")!.GetValue(scan)!).Cast<(int, int, int)>().SequenceEqual(faces),
+            "Independent scan recovery changed source triangles.");
+        unknown[40 + 50 * 24] = true;
+        Require(independent.Invoke(null, [typed, unknown, guide, CancellationToken.None]) is null,
+            "A dictionary-dependent coordinate was accepted as an independent measurement.");
+        unknown[40 + 50 * 24] = false;
+        unknown[40 + expected.Count * 24 + 8] = true;
+        Require(independent.Invoke(null, [typed, unknown, guide, CancellationToken.None]) is null,
+            "A dictionary-dependent triangle index was accepted.");
+        Console.WriteLine("PASS independent dense recovery: exact measured coordinates and source topology retained; unknown geometry rejected.");
         var refine = converter.GetMethod("TryRefinePolygonSurface", BindingFlags.NonPublic | BindingFlags.Static)!;
         object? result = refine.Invoke(null, [shifted, 12, guide, CancellationToken.None]);
         Require(result is not null, "Guided scan refinement rejected a recoverable measured surface.");

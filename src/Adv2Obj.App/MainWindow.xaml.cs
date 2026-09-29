@@ -121,6 +121,7 @@ public partial class MainWindow : Window
                     ConversionResult result = outcome.Conversion;
                     if (result.UsesCoarseSurface) item.Status = "Review (coarse)";
                     if (result.UsesRecoveredScanSurface) item.Status = "Review (scan)";
+                    if (result.UsesContourSurface) item.Status = "Review (contours)";
                     item.Details = $"{result.ObjectFileCount:N0} OBJ + CSV + INI files";
                     if (result.RepairedVertexCount > 0)
                     {

@@ -10,6 +10,7 @@ internal static class DecoderChecks
         CheckTouchingSurfaces();
         ShiftedMeshChecks.Run();
         PolygonMeshChecks.Run();
+        ContourSurfaceChecks.Run();
         string temporary = Directory.CreateTempSubdirectory("adv2obj-decoder-").FullName;
         try
         {
@@ -114,6 +115,33 @@ internal static class DecoderChecks
             Require(File.ReadAllLines(Path.Combine(inactiveResult.OutputDirectory, "inactive-mode-four_GalaxySymbols.csv")).SequenceEqual(symbols),
                 "An explicitly empty mode-four slot must not invent a coordinate or lose active symbols.");
             Console.WriteLine("PASS symbol modes, shortened headers/copies, and extended inactive table: exact coordinates preserved.");
+            byte[] inactiveWithDecoy = new byte[32 + 80 + 5 * 128];
+            galaxySignature.CopyTo(inactiveWithDecoy, 0);
+            BitConverter.GetBytes(6).CopyTo(inactiveWithDecoy, 28);
+            foreach (var (offset, value) in new[] { (32, 5), (36, 5), (40, 2), (44, 3) })
+                BitConverter.GetBytes(value).CopyTo(inactiveWithDecoy, offset);
+            int[] ordinals = [1, 4, 0, 3, 2];
+            for (int i = 0; i < 5; i++)
+            {
+                int offset = 112 + i * 128;
+                BitConverter.GetBytes(i).CopyTo(inactiveWithDecoy, offset);
+                BitConverter.GetBytes(ordinals[i]).CopyTo(inactiveWithDecoy, offset + 4);
+                BitConverter.GetBytes(1).CopyTo(inactiveWithDecoy, offset + 8);
+                for (int copy = 0; copy < 2; copy++)
+                for (int axis = 0; axis < 3; axis++)
+                    BitConverter.GetBytes(100.0 * (axis + 1) + i).CopyTo(inactiveWithDecoy, offset + 16 + copy * 24 + axis * 8);
+            }
+            int decoy = 176;
+            foreach (var (offset, value) in new[] { (0, 2), (4, 1), (8, 1) })
+                BitConverter.GetBytes(value).CopyTo(inactiveWithDecoy, decoy + offset);
+            for (int axis = 0; axis < 3; axis++)
+                BitConverter.GetBytes(1000.0 + axis).CopyTo(inactiveWithDecoy, decoy + 16 + axis * 8);
+            var decodeSymbols = typeof(AdvToObjConverter).GetMethod("DecodeGalaxySymbols", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+            var recoveredSymbols = ((System.Collections.IEnumerable)decodeSymbols.Invoke(null, [inactiveWithDecoy])!).Cast<object>().ToArray();
+            var recoveredPositions = recoveredSymbols.Select(s => s.GetType().GetProperty("Position")!.GetValue(s)!).ToArray();
+            Require(recoveredSymbols.Length == 5 && recoveredPositions.All(p => (double)p.GetType().GetProperty("X")!.GetValue(p)! < 200),
+                "A header-like decoy must not replace exact duplicated positions in an inactive-symbol table.");
+            Console.WriteLine("PASS inactive symbol table with misleading nested headers: exact duplicate coordinates selected.");
             byte[] declaredSymbols = reorderedSymbols.AsSpan(firstSymbol, 3 * 80).ToArray();
             foreach ((int destination, int original) in new[] { (0, 1), (1, 2), (2, 0) })
                 declaredSymbols.AsSpan(original * 80, 80).CopyTo(

@@ -73,7 +73,7 @@ public sealed partial class AdvToObjConverter
         => ConvertCoreAsync(inputPath, outputRoot, cancellationToken, allowScanRefinement: true);
 
     private async Task<ConversionResult> ConvertCoreAsync(string inputPath, string outputRoot,
-        CancellationToken cancellationToken, bool allowScanRefinement)
+        CancellationToken cancellationToken, bool allowScanRefinement, bool preferStoredSurface = false)
     {
         byte[] source = await File.ReadAllBytesAsync(inputPath, cancellationToken);
         ValidateAdv(source);
@@ -83,20 +83,39 @@ public sealed partial class AdvToObjConverter
         byte[] payload = [];
         int roughRecordEnd = checked((int)ReadUInt32(source, 0x34));
         bool alternateRawMesh = false;
+        bool recoveredPrimarySurface = false;
         Mesh? recoveredFromInflate = null;
         try
         {
             (payload, roughRecordEnd, alternateRawMesh) = DecompressRoughPayload(source);
+            if (alternateRawMesh && allowScanRefinement)
+            {
+                int primaryEnd = roughRecordEnd;
+                Mesh? primary = RecoverStoredRawSurface(source, ref primaryEnd, cancellationToken);
+                if (primary is not null)
+                {
+                    recoveredFromInflate = primary;
+                    roughRecordEnd = primaryEnd;
+                    alternateRawMesh = false;
+                    recoveredPrimarySurface = true;
+                    primary.Warnings.Add("Recovered the primary stored rough surface instead of using a later cached mesh. Requires visual review.");
+                }
+            }
         }
         catch (AdvFormatException primaryError)
         {
+            byte[] prefix = ReadPrimaryInflatePrefix(source);
             recoveredFromInflate = FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
                 ?? RecoverStoredRawSurface(source, ref roughRecordEnd, cancellationToken)
-                ?? RecoverCompressedStoredSurface(source, ref roughRecordEnd, cancellationToken)
+                ?? RecoverCompressedStoredSurface(source, ref roughRecordEnd, cancellationToken, allowScanRefinement)
+                ?? RecoverPolygonMesh(prefix, cancellationToken, allowScanRefinement: false)
+                ?? TryRecoverPairedPolygonSurface(prefix, cancellationToken)
+                ?? RecoverCorroboratedRoughCopy(source, prefix, cancellationToken)
+                ?? RecoverContourSurfaceWithFallback(source, prefix, cancellationToken, allowScanRefinement)
                 ?? throw new AdvFormatException(
                     $"{primaryError.Message} No complete alternate mesh was found.");
             recoveredFromInflate.Warnings.Add(
-                "Primary rough mesh cannot be decompressed; recovered a closed alternate mesh from the ADV. Verify its shape in MeshLab.");
+                "The primary rough stream required recovery. Verify the recovered surface in MeshLab.");
         }
         Mesh mesh;
         if (recoveredFromInflate is not null)
@@ -141,6 +160,9 @@ public sealed partial class AdvToObjConverter
                         ?? FindAlternateClosedMesh(source, roughRecordEnd, cancellationToken)
                         ?? RecoverPolygonMesh(payload, cancellationToken, allowScanRefinement)
                         ?? TryRecoverStoredPolygon(payload, cancellationToken)
+                        ?? TryRecoverPairedPolygonSurface(payload, cancellationToken)
+                        ?? RecoverCorroboratedRoughCopy(source, payload, cancellationToken)
+                        ?? RecoverContourSurfaceWithFallback(source, payload, cancellationToken, allowScanRefinement)
                         ?? throw new AdvFormatException(
                             $"{primaryError.Message} No complete alternate mesh was found.");
                     mesh.Warnings.Add(
@@ -148,6 +170,9 @@ public sealed partial class AdvToObjConverter
                 }
             }
         }
+        mesh = preferStoredSurface
+            ? TryRecoverStoredPolygon(payload, cancellationToken) ?? mesh
+            : CorrectRecoveredScanSpikes(payload, mesh, cancellationToken);
         if (alternateRawMesh)
         {
             mesh.Warnings.Add(
@@ -200,8 +225,20 @@ public sealed partial class AdvToObjConverter
                     throw new AdvFormatException("A cut could not be recovered on the refined scan surface.");
                 continue;
             }
+            if (CountInvalidEdges(slice.Faces) > 0 && !preferStoredSurface
+                && !mesh.UsesCoarseSurface && TryRecoverStoredPolygon(payload, cancellationToken) is not null)
+            {
+                // Do not publish a successful-looking set containing a torn
+                // kerf. Retry the complete set against the validated stored
+                // surface so Rough and Saw/Pie refer to the same geometry.
+                ConversionResult fallback = await ConvertCoreAsync(inputPath, outputRoot,
+                    cancellationToken, allowScanRefinement: false, preferStoredSurface: true);
+                return fallback with { Warnings = [.. fallback.Warnings,
+                    "The recovered dense scan produced a non-manifold cut; used the verified stored polygon surface for the complete output set. Requires visual review."] };
+            }
             if (mesh.UsesCoarseSurface) slice = slice with { UsesCoarseSurface = true };
             if (mesh.UsesRecoveredScanSurface) slice = slice with { UsesRecoveredScanSurface = true };
+            if (mesh.UsesContourSurface) slice = slice with { UsesContourSurface = true };
             await WriteObjAtomicallyAsync(
                 Path.Combine(stagingDirectory, $"{stem}_{cut.Name}.obj"),
                 slice,
@@ -233,14 +270,15 @@ public sealed partial class AdvToObjConverter
             mesh.Vertices.Count,
             mesh.Faces.Count,
             mesh.RepairedVertexCount,
-            warnings) { UsesCoarseSurface = mesh.UsesCoarseSurface, UsesRecoveredScanSurface = mesh.UsesRecoveredScanSurface };
+            warnings) { UsesCoarseSurface = mesh.UsesCoarseSurface, UsesRecoveredScanSurface = mesh.UsesRecoveredScanSurface,
+                UsesContourSurface = mesh.UsesContourSurface };
         }
-        catch (AdvFormatException) when (mesh.UsesRecoveredScanSurface && allowScanRefinement)
+        catch (AdvFormatException) when ((mesh.UsesRecoveredScanSurface || mesh.UsesContourSurface || recoveredPrimarySurface) && allowScanRefinement)
         {
             ConversionResult fallback = await ConvertCoreAsync(inputPath, outputRoot,
                 cancellationToken, allowScanRefinement: false);
             return fallback with { Warnings = [.. fallback.Warnings,
-                "Scan refinement did not produce a complete cutting plan; retained the polygon-surface conversion."] };
+                "The accuracy recovery did not produce a complete cutting plan; retained the established fallback conversion."] };
         }
         finally
         {
@@ -817,7 +855,7 @@ public sealed partial class AdvToObjConverter
 
     private static Mesh ClipClosedMesh(Mesh source, Vertex normal, double offset, bool keepLessOrEqual)
     {
-        var builder = new MeshBuilder(source.RepairedVertexCount > 0);
+        var builder = new MeshBuilder(source.RepairedVertexCount > 0 || source.UsesContourSurface);
         foreach ((int a, int b, int c) in source.Faces)
         {
             List<Vertex> polygon = [source.Vertices[a], source.Vertices[b], source.Vertices[c]];
@@ -833,7 +871,8 @@ public sealed partial class AdvToObjConverter
 
         builder.CapOpenBoundaries();
         ReportApproximateCaps(source, builder);
-        return new Mesh(builder.Vertices, builder.Faces, source.RepairedVertexCount, source.Warnings);
+        return new Mesh(builder.Vertices, builder.Faces, source.RepairedVertexCount, source.Warnings)
+            { UsesContourSurface = source.UsesContourSurface };
     }
 
     private static int CountInvalidEdges(List<(int A, int B, int C)> faces)
@@ -981,7 +1020,8 @@ public sealed partial class AdvToObjConverter
 
         // Prefer an explicitly bounded table to a guessed six-symbol sequence.
         // An ADV can also contain older plans or inactive symbol records.
-        List<GalaxyCandidate>? required = FindGuidGalaxyTable(source, candidates)
+        List<GalaxyCandidate>? required = FindVerifiedInactiveGalaxyTable(source, candidates)
+            ?? FindGuidGalaxyTable(source, candidates)
             ?? FindCountedGalaxyTable(source, candidates)
             ?? FindShiftedVariant2GalaxyTable(source)
             ?? FindGalaxyTableWithInactiveSlot(source, candidates)
@@ -2142,6 +2182,8 @@ public sealed partial class AdvToObjConverter
             await writer.WriteLineAsync("# Recovery: stored polygon surface; coarser than the dense scan. Requires visual review.");
         if (mesh.UsesRecoveredScanSurface)
             await writer.WriteLineAsync("# Recovery: measured scan points with reconstructed triangle connectivity. Requires visual review.");
+        if (mesh.UsesContourSurface)
+            await writer.WriteLineAsync("# Recovery: measured horizontal contours with reconstructed connectivity and bridged missing levels. Requires visual review.");
         await writer.WriteLineAsync($"g {groupName}");
         foreach (Vertex vertex in mesh.Vertices)
         {
@@ -2412,5 +2454,6 @@ public sealed partial class AdvToObjConverter
     {
         public bool UsesCoarseSurface { get; init; }
         public bool UsesRecoveredScanSurface { get; init; }
+        public bool UsesContourSurface { get; init; }
     }
 }

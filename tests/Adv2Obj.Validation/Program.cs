@@ -1,5 +1,46 @@
 using Adv2Obj.Core;
 
+if (args is ["--export-recovery", string recoveryPayload, string recoveryOutput])
+{
+    Directory.CreateDirectory(recoveryOutput);
+    var type = typeof(AdvToObjConverter);
+    var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+    foreach (string name in new[] { "TryRecoverDeclaredMesh", "TryRecoverStoredPolygon", "TryRecoverSegmentedMesh" })
+    {
+        var method = type.GetMethod(name, flags)!;
+        object? mesh = method.Invoke(null, name == "TryRecoverDeclaredMesh"
+            ? [File.ReadAllBytes(recoveryPayload), CancellationToken.None, true]
+            : [File.ReadAllBytes(recoveryPayload), CancellationToken.None]);
+        if (mesh is null) continue;
+        await (Task)type.GetMethod("WriteObjAsync", flags)!.Invoke(null,
+            [Path.Combine(recoveryOutput, name + ".obj"), mesh, "Rough", CancellationToken.None])!;
+    }
+    return;
+}
+
+if (args is ["--contour-diagnostic", string contourInput, string contourPayload])
+{
+    System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
+    var method = typeof(AdvToObjConverter).GetMethod("RecoverContourSurface",
+        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+    Console.WriteLine(method.Invoke(null, [File.ReadAllBytes(contourInput), File.ReadAllBytes(contourPayload), CancellationToken.None]) ?? "No recovery");
+    return;
+}
+
+if (args is ["--paired-diagnostic", string pairedFolder])
+{
+    if (Environment.GetEnvironmentVariable("ADV2OBJ_TRACE") == "1")
+        System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
+    var method = typeof(AdvToObjConverter).GetMethod("TryRecoverPairedPolygonSurface",
+        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+    foreach (string file in File.Exists(pairedFolder) ? new[] { pairedFolder } : Directory.EnumerateFiles(pairedFolder, "*.bin"))
+    {
+        Console.WriteLine(Path.GetFileName(file));
+        try { Console.WriteLine(method.Invoke(null, [File.ReadAllBytes(file), CancellationToken.None]) is null ? "NO" : "RECOVERED"); }
+        catch (Exception error) { Console.WriteLine(error.GetBaseException().Message); }
+    }
+    return;
+}
 
 if (args is ["--record-diagnostic", string diagnosticFile])
 {
@@ -24,7 +65,7 @@ if (args is ["--recovery-diagnostic", string payloadFile])
 {
     System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.ConsoleTraceListener());
     byte[] payload = File.ReadAllBytes(payloadFile);
-    foreach (string name in new[] { "DecodeMesh", "TryRecoverDeclaredMesh", "TryRecoverStoredPolygon", "TryRecoverSegmentedMesh", "TryRecoverPolygonMesh" })
+    foreach (string name in new[] { "DecodeMesh", "TryRecoverDeclaredMesh", "TryRecoverStoredPolygon", "TryRecoverSegmentedMesh", "TryRecoverPolygonMesh", "TryRecoverPairedPolygonSurface" })
     {
         Console.WriteLine(name);
         try

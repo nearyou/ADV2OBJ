@@ -15,6 +15,7 @@ internal static class PolygonMeshChecks
         object complete = Decode(intact) ?? throw new Exception("Stored polygon pair was not recovered.");
         CheckGeometry(complete, vertices);
         CheckBoundedRecovery(vertices, polygons);
+        CheckMaskedPolygonRecovery();
         Require((bool)complete.GetType().GetProperty("UsesCoarseSurface")!.GetValue(complete)!,
             "Polygon fallback must be identified as a coarse surface.");
 
@@ -122,7 +123,7 @@ internal static class PolygonMeshChecks
         // ZippedData is ten bytes; the payload follows at offset 96.
         zip.CopyTo(container, 96);
         var restart = typeof(AdvToObjConverter).GetMethod("RecoverCompressedStoredSurface", BindingFlags.Static | BindingFlags.NonPublic)!;
-        object?[] restartArgs = [container, 64, CancellationToken.None];
+        object?[] restartArgs = [container, 64, CancellationToken.None, true];
         object recoveredBlock = restart.Invoke(null, restartArgs) ?? throw new Exception("A verified polygon surface after a broken DEFLATE block was not recovered.");
         CheckGeometry(recoveredBlock, vertices);
         Require((bool)recoveredBlock.GetType().GetProperty("UsesCoarseSurface")!.GetValue(recoveredBlock)!,
@@ -167,9 +168,8 @@ internal static class PolygonMeshChecks
 
     // A synthetic convex solid with mixed polygon sizes and a small planar cap.
     // It exercises the serialized V/E/F relation without depending on ADV samples.
-    private static (List<Point>, List<int[]>) MakeTruncatedBipyramid()
+    private static (List<Point>, List<int[]>) MakeTruncatedBipyramid(int sectors = 32)
     {
-        const int sectors = 32;
         var original = new List<Point> { new(0, 0, -1000), new(0, 0, 1000) };
         for (int i = 0; i < sectors; i++) original.Add(new(1000 * Math.Cos(2 * Math.PI * i / sectors),
             1000 * Math.Sin(2 * Math.PI * i / sectors), 0));
@@ -217,6 +217,73 @@ internal static class PolygonMeshChecks
         foreach (int i in polygons[0]) vertices[i] = vertices[i] with { Z = level };
         Require(vertices.Count == polygons.Count * 2 - 4, "Invalid synthetic polygon topology.");
         return (vertices, polygons);
+    }
+
+    private static void CheckMaskedPolygonRecovery()
+    {
+        var (vertices, polygons) = MakeTruncatedBipyramid(64);
+        var method = typeof(AdvToObjConverter).GetMethod("TryRecoverPairedPolygonSurface", BindingFlags.Static | BindingFlags.NonPublic)!;
+        object? Read(byte[] data) => method.Invoke(null, [data, CancellationToken.None]);
+        byte[] Mask(List<Point> points)
+        {
+            byte[] data = Payload(points, polygons);
+            int length = 40 + points.Count * 38;
+            const uint marker = 0x975631e7;
+            for (int copy = 0; copy < 2; copy++)
+            {
+                int header = copy * length;
+                BitConverter.GetBytes(marker).CopyTo(data, header + 16);
+                BitConverter.GetBytes(marker & 0xffffff00 | (uint)(points.Count & 255)).CopyTo(data, header + 24);
+                int cursor = header + 32 + points.Count * 24;
+                foreach (int[] face in polygons)
+                {
+                    foreach (int i in Enumerable.Range(0, face.Length))
+                    {
+                        uint value = face[i] == 0 ? 0u : face[i] == 1 ? marker : marker & 0xffffff00 | (uint)(face[i] & 255);
+                        BitConverter.GetBytes(value).CopyTo(data, cursor + 4 + i * 4);
+                    }
+                    cursor += 4 + face.Length * 4;
+                }
+            }
+            return data;
+        }
+        byte[] masked = Mask(vertices);
+        CheckGeometry(Read(masked) ?? throw new Exception("Upper-byte index recovery failed."), vertices);
+        var reflected = vertices.ToList();
+        foreach (int i in polygons[0]) reflected[i] = reflected[i] with { Z = -reflected[i].Z };
+        CheckGeometry(Read(Mask(reflected)) ?? throw new Exception("Masked cap sign was not recovered."), vertices);
+        var smallCap = vertices.ToList();
+        foreach (int i in polygons[0]) smallCap[i] = smallCap[i] with { Z = 1e-7 };
+        CheckGeometry(Read(Mask(smallCap)) ?? throw new Exception("A finite but incorrect cap height was not recovered from coplanarity."), vertices);
+        byte[] brokenSize = masked.ToArray();
+        BitConverter.GetBytes(0).CopyTo(brokenSize, 32 + vertices.Count * 24);
+        CheckGeometry(Read(brokenSize) ?? throw new Exception("A damaged polygon size discarded the remaining source planes."), vertices);
+        byte[] unsupported = masked.ToArray();
+        Array.Clear(unsupported, 32 + vertices.Count * 24, 12 * vertices.Count);
+        Require(Read(unsupported) is null, "Unsupported polygon geometry must not pass through index recovery.");
+
+        byte[] Container(byte[] primary, byte[] copy)
+        {
+            using var stream = new MemoryStream();
+            using (var archive = new System.IO.Compression.ZipArchive(stream, System.IO.Compression.ZipArchiveMode.Create, true))
+            {
+                foreach (var (name, data) in new[] { ("ZippedData", primary), ("StoredRough", copy) })
+                {
+                    using var entry = archive.CreateEntry(name).Open();
+                    entry.Write(data); entry.Write(new byte[60000]);
+                }
+            }
+            byte[] result = new byte[64 + stream.Length];
+            BitConverter.GetBytes(64).CopyTo(result, 52); stream.ToArray().CopyTo(result, 64);
+            return result;
+        }
+        var corroborate = typeof(AdvToObjConverter).GetMethod("RecoverCorroboratedRoughCopy", BindingFlags.Static | BindingFlags.NonPublic)!;
+        CheckGeometry(corroborate.Invoke(null, [Container(masked, masked), masked, CancellationToken.None])
+            ?? throw new Exception("An independently corroborated rough copy was rejected."), vertices);
+        byte[] unrelated = Mask(vertices.Select(v => v with { X = v.X + 125 }).ToList());
+        Require(corroborate.Invoke(null, [Container(masked, unrelated), masked, CancellationToken.None]) is null,
+            "A same-count unrelated mesh must not replace the primary rough.");
+        Console.WriteLine("PASS masked polygon indices: >256 vertices, exact retained coordinates, cap recovery, damaged-size recovery, unsupported planes rejected, and unrelated cached mesh rejected.");
     }
 
     private readonly record struct Point(double X, double Y, double Z);

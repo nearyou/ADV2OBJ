@@ -11,6 +11,7 @@ public sealed record ConversionResult(
 {
     public bool UsesCoarseSurface { get; init; }
     public bool UsesRecoveredScanSurface { get; init; }
+    public bool UsesContourSurface { get; init; }
 }
 
 public sealed record ConversionAndCleanupResult(

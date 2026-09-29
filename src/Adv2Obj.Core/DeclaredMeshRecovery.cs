@@ -82,7 +82,6 @@ public sealed partial class AdvToObjConverter
                 var loops = SparseMeshBoundary(faces);
                 if (loops is null) continue;
                 int retained = faces.Count;
-                bool spatialPatch = false;
                 var usedEdges = faces.SelectMany(f => new[] { (f.A, f.B), (f.B, f.C), (f.C, f.A) })
                     .Select(e => (Math.Min(e.Item1, e.Item2), Math.Max(e.Item1, e.Item2))).ToHashSet();
                 foreach (var loop in loops)
@@ -91,7 +90,6 @@ public sealed partial class AdvToObjConverter
                     if (!complete)
                     {
                         cap = TriangulateSpatialGap(loop, vertices, usedEdges, out complete);
-                        spatialPatch = true;
                     }
                     if (!complete) throw new AdvFormatException("A source triangle gap could not be triangulated.");
                     faces.AddRange(cap);
@@ -99,7 +97,7 @@ public sealed partial class AdvToObjConverter
                 if (!RestorePatchVertices(vertices, faces, retained)) { System.Diagnostics.Trace.WriteLine("Patch interior vertices could not be restored."); continue; }
                 if (CountInvalidEdges(faces) != 0) { System.Diagnostics.Trace.WriteLine("Patch edges do not close."); continue; }
                 if (faces.Count != record.Faces) { System.Diagnostics.Trace.WriteLine($"Patch face count {faces.Count}, expected {record.Faces}; vertices {vertices.Count}."); continue; }
-                if ((attempt > 0 || spatialPatch) && record.Table != record.Header + 28 + record.Vertices * 24)
+                if (record.Table != record.Header + 28 + record.Vertices * 24)
                 {
                     var lengths = sourceFaces.Select(f => Math.Max(Distance(vertices[f.A], vertices[f.B]),
                         Math.Max(Distance(vertices[f.B], vertices[f.C]), Distance(vertices[f.C], vertices[f.A])))).Order().ToArray();

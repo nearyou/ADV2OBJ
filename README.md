@@ -326,9 +326,160 @@ that depends on unavailable history. Such coordinate bytes are marked unknown
 before incident-plane recovery; dependent type signatures and count bytes are
 rejected. Only the validated coarse polygon surface is exported from this path.
 
-Five inputs use coarse recovery: `1429.28-1204`, `1429.28-2242`,
-`1429.28-2313`, `1429.28-2683`, and `1429.28-318`. These require MeshLab review
+Six inputs use coarse recovery: `1429.28-1204`, `1429.28-2242`,
+`1429.28-2313`, `1429.28-2643`, `1429.28-2683`, and `1429.28-318`. These require MeshLab review
 and are not verified exact Advisor exports. Existing cut-history, alternate-mesh,
 coordinate-repair, and approximate-cap warnings remain visible. Synthetic tests
 cover the new symbol layouts, exact copied coordinates, inactive slots, restart
 after a broken compressed block, and exclusion of dictionary-dependent data.
+
+## September 22 accuracy update
+
+All 85 available regression inputs still convert, producing 467 OBJ files and
+85 CSV/INI pairs. The single-file build is
+`Release/2026-09-22-accuracy/ADV2OBJ.exe`. Validation retains source inputs.
+
+After a compressed-stream restart, the converter now preserves a complete dense
+scan when every coordinate and triangle byte is independent of the missing
+dictionary. Record boundaries, closed topology, bounds, volume, and containment
+within the independently recovered polygon guide must agree. For `1429.28-2242`,
+this preserves all 10,663 measured vertices and 21,322 source triangles instead
+of exporting a 134-vertex approximation. Direct comparison confirms the rough
+OBJ coordinates and triangle indices match the decoded source arrays exactly.
+Synthetic checks reject this recovery if any geometry byte depends on missing
+history.
+
+A verified primary stored surface takes precedence over a later cached raw mesh.
+This restores the missing Saw17-1 output in `1429.28-1237`. If the recovered
+surface cannot produce a valid cutting plan, the established fallback remains
+available. Distortion checks now apply to every shifted declared scan recovery;
+`1429.28-155` and `1429.28-197` use verified stored polygon surfaces instead of
+scans with many implausibly long edges. These are explicitly marked coarse
+recoveries requiring visual review.
+
+Only these four models change in the regression set. All CSV/INI files and the
+six original sample conversions remain byte-identical to the preceding release.
+The changes use input records and geometry validation, with no filename/hash
+matching or reference-output substitution in production. Structural validation
+does not establish exact equivalence to Advisor exports; reconstructed cuts and
+coarse recoveries retain their review warnings.
+
+## September 25 failed-file batch
+
+The 66 files supplied in `Downloads/fail (2)/fail` exposed additional damaged or
+unrecognized mesh encodings. The updated pipeline converts 51 files to 158 OBJ
+files and 51 CSV/INI pairs; 15 files still fail. This does not establish exact
+Advisor equivalence. The new recoveries export the stored polygon approximation
+and explicitly require visual review. The single-file Windows build is
+`Release/2026-09-25-recovery/ADV2OBJ.exe`.
+
+Upper index bytes are resolved against geometric supporting planes, including
+records with more than 256 vertices. Acceptance requires retaining every stored
+surface vertex, corroborating at least 95% of the declared planes and 90% of the
+polygon index slots, and passing closed-surface validation. Repeated cap heights
+can be recovered from coplanarity only when several source polygons agree on a
+unique height. Unreadable polygon sizes can use the remaining bounded records.
+
+A later stored rough copy is eligible only when its vertex count agrees and at
+least 90% of its complete XYZ byte triples occur in the bounded primary polygon
+record. An unrelated cached plan mesh is rejected. Complete polygon records in a
+readable DEFLATE prefix can be recovered even when a later part of the compressed
+member fails. Inactive Galaxy tables prefer matching duplicated coordinates over
+header-like values inside nested records.
+
+All 85 previous regression inputs continue converting with byte-identical output
+(637 files). Synthetic tests cover masked indices above 255, unchanged measured
+coordinates, cap heights, damaged size words, unrelated cached meshes, and
+inactive-symbol decoys. All 158 new meshes pass coordinate, index, closed-edge,
+and surface checks. Validation retains all source ADV files. No filename/hash
+lookups or reference-output substitution are used in these recovery paths.
+
+The remaining failures are listed in `artifacts/fail66-verified.txt`. Those files
+still need a decoder that can establish their missing geometry; they are not
+reported as successful conversions.
+
+## September 25 contour recovery update
+
+The later build, `Release/2026-09-25-contours/ADV2OBJ.exe`, converts all 66 inputs
+in that batch, including the 15 failures above. Combined output is 221 OBJ files
+and 66 CSV/INI pairs. All 85 older regression inputs also pass. The 897 output
+files from the 136 previously successful inputs are byte-identical to the
+preceding build. Test conversions retain the source ADV files.
+
+This last-resort decoder reads the primary rough record's counted horizontal
+XY contours. It validates height spacing, record boundaries, coordinate ranges,
+outline intersections, terminal coverage, and closed surface topology. It keeps
+the measured concavities and uses an ordered shortest-strip triangulation to
+connect adjacent contours without moving their measured points. A later stored
+contour copy can fill gaps only after broad agreement with the primary record's
+exact coordinates, height spacing, and XY extents. Large unsupported gaps and
+unrelated stored models remain rejected.
+
+The recovered files are labelled **Review (contours)**. Their warnings disclose
+the recovered contour count, omitted unreadable points, bridged levels, and
+largest interval. Their OBJ headers also identify reconstruction. These are
+usable reconstructed surfaces, not certified exact Advisor exports. The 63 new
+OBJ files pass coordinate, index, closed-edge, and surface checks. Synthetic
+tests verify measured coordinates and concavities, masked headers, bounded gaps,
+complete terminal coverage, copy corroboration, rejection of unrelated models,
+and cancellation. No filename/hash lookup or reference-output substitution is
+used. The checked-by-default deletion preference remains unchanged.
+
+See `artifacts/contour-recovery-report-2026-09-25.md` for results and limitations.
+Success on the available inputs does not establish support for every possible
+ADV version or file with insufficient readable geometry.
+
+## September 25 measured-detail update
+
+`Release/2026-09-25-precision/ADV2OBJ.exe` retains an additional 41,061 measured
+points and 253 contour levels across the 15 contour-recovered inputs. All 151
+available inputs convert (66 recent files and 85 earlier regressions). The 897
+output files from the other 136 inputs remain byte-identical, as do all CSV/INI
+files for the refined models. All 63 refined OBJ meshes pass structural checks.
+
+Neighboring counted records now help recover a contour header with one damaged
+height byte. When all height bytes survive, a verified record boundary can also
+recover damaged version framing. Conflicting candidates remain rejected.
+For small local byte gaps, the decoder reads intact coordinates independently
+from both ends, checks them against the adjacent measured contours, and retains
+only points common to every supported alignment. It never interpolates missing
+XY coordinates. The established recovery remains available if the additional
+measurements cannot produce a valid surface or cutting plan.
+
+Synthetic tests cover exact coordinate preservation across several byte-gap
+alignments, damaged height/version fields, conflicting counts, unsupported gaps,
+and the existing rejection and cancellation behavior. Source inputs were retained
+during regression tests. See `artifacts/precision-report-2026-09-25.md` for the
+per-model comparison. These changes reduce reconstruction; they do not certify
+exact equivalence to Advisor exports or every unknown ADV format.
+
+## September 29 spiked-mesh correction
+
+`Release/2026-09-29-mesh-fix/ADV2OBJ.exe` corrects the four models supplied in
+`Downloads/adv+obj damag`. The previous executable's OBJ output was reproduced
+byte for byte before applying the fix. Closed triangle connectivity had hidden
+incorrectly aligned coordinates, producing very long spikes. A separate case
+produced a cut with unmatched edges even though its rough surface looked intact.
+
+Recovered dense scans now undergo a geometry check using triangle edge lengths
+and robust coordinate extents. When that check detects a sustained population
+of spikes, the converter first tries the counted dense record aligned against
+an independently validated stored surface, then the validated polygon surface.
+If a dense scan produces a non-manifold cut and a stored polygon recovery is
+available, the entire output set is retried against that surface. Rough and
+Saw/Pie files therefore use the same replacement geometry.
+
+The corrected `1085.48-347` keeps its 12,195-vertex dense scan. `1085.48-703`,
+`1085.48-715`, and `1085.48-985` use stored polygon surfaces and retain the
+**Review (coarse)** label. Their detail is lower than a valid dense scan; exact
+equivalence to Advisor exports has not been established. All eight resulting
+OBJ meshes pass finite-coordinate, index, closed-edge and surface checks, and
+all four CSV/INI pairs are unchanged. No input-name/hash shortcuts are used.
+
+Validation passed on all 155 available inputs: the four reported files plus
+all 151 earlier inputs. One earlier model (`27_8_396.83A-A2.2-1291-7-1`) also
+triggered the new geometry/cut checks and now uses its validated stored polygon
+surface; its ten OBJ files change. The other 980 previous output files are
+byte-identical, including every previous CSV/INI file. All 59 OBJ files in the
+seven-input regression group containing that model pass structural checks.
+See `artifacts/damage-report-2026-09-29.md` for evidence and accuracy limits.
